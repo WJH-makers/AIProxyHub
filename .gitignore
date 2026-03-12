@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.venv/
+venv/
+
+# 本地配置/数据（敏感，不应公开）
+settings.json
+data/
+
+# OMX/Claude/Codex 本地状态与日志（不应提交到公开仓库）
+.omx/
+
+# 运行时临时产物
+*.runtime.*
+*.log
+
+# 构建产物
+dist/
+build/
+release/
+*.spec
+
+# 第三方工具缓存（例如 NSIS zip 解压）
+.tools/
+
+# 第三方二进制（如需请自行下载/放置；不建议提交到公开仓库）
+cli-proxy-api.exe
