@@ -52,7 +52,9 @@ try {
     Write-Host "[NSIS] ⚠️ 无法自动检查/修复 .nsi 编码（将继续尝试构建）：$($_.Exception.Message)"
   }
 
-  & $makensis "/DAPP_VERSION=$ver" "/DOUTFILE=$out" $nsi | Out-Host
+  $defs = @("/DAPP_VERSION=$ver", "/DOUTFILE=$out")
+  if ($OneDir) { $defs += "/DONEDIR=1" }
+  & $makensis @defs $nsi | Out-Host
   if ($LASTEXITCODE -ne 0) {
     throw "makensis 失败，退出码 $LASTEXITCODE"
   }

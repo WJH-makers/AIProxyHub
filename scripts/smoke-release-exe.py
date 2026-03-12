@@ -445,6 +445,9 @@ def main() -> int:
                     ids.append(str(it["id"]))
         except Exception:
             ids = []
+        models_count = int(len(ids))
+        # 避免输出过大：仅给出一个样本列表，便于快速确认“模型目录可用”
+        models_sample = list(ids[:20])
         prefer = [
             "gpt-5.2-codex",
             "gpt-5.1-codex",
@@ -589,6 +592,9 @@ def main() -> int:
             raise RuntimeError(f"/v0/management/usage(2) 失败: {u1.status}")
         u1j = u1.json()
         after = int(((u1j.get("usage") or {}).get("total_requests") or 0))
+        after_tokens = int(((u1j.get("usage") or {}).get("total_tokens") or 0))
+        after_success = int(((u1j.get("usage") or {}).get("success_count") or 0))
+        after_failure = int(((u1j.get("usage") or {}).get("failure_count") or 0))
         if resp_ok and after < before + 1:
             raise RuntimeError(f"usage 未按预期增长（before={before}, after={after}）")
         if args.test_cache and resp_ok and cache_hit:
@@ -603,6 +609,14 @@ def main() -> int:
         rq = http_request(f"{launcher_base}/api/ext/quota", headers=auth, timeout=30)
         if rq.status != 200:
             raise RuntimeError(f"/api/ext/quota 失败: {rq.status} {rq.body[:200]!r}")
+        rqj = rq.json()
+        quota_out = {
+            "ok": bool(rqj.get("ok", False)),
+            "total": int(rqj.get("total", 0) or 0),
+            "active": int(rqj.get("active", 0) or 0),
+            "pct": int(rqj.get("pct", 0) or 0),
+            "below_threshold": bool(rqj.get("below_threshold", False)),
+        }
 
         # 输出：只打印端点、端口、以及脱敏 key（便于回放）
         print(json.dumps(
@@ -614,8 +628,13 @@ def main() -> int:
                 "proxy_base": proxy_base,
                 "api_key_masked": mask_secret(api_key),
                 "management_key_masked": mask_secret(mgmt_key),
+                "models_count": models_count,
+                "models_sample": models_sample,
                 "infer_model": infer_model,
                 "usage_total_requests": after,
+                "usage_total_tokens": after_tokens,
+                "usage_success_count": after_success,
+                "usage_failure_count": after_failure,
                 "responses_ok": bool(resp_ok),
                 "cache_test_enabled": bool(args.test_cache),
                 "cache_shared_across_api_keys": bool(getattr(args, "share_cache_across_api_keys", False)),
@@ -623,6 +642,7 @@ def main() -> int:
                 "chat_cache_hit": bool(chat_cache_hit),
                 "load_test": load_result,
                 "register_worker_ok": bool(register_worker_ok),
+                "quota": quota_out,
             },
             ensure_ascii=False,
         ))

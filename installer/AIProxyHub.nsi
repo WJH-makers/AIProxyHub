@@ -2,7 +2,7 @@
 ;
 ; 目标：
 ; - 像 QQ/微信 一样：安装到本机 + 桌面图标 + 开始菜单 + 卸载入口
-; - 程序本体只有一个 AIProxyHub.exe（内部已打包 CLIProxyAPI 与注册逻辑）
+; - 支持 onefile/onedir 两种打包形态（onedir 冷启动更快，适合安装版）
 ; - 用户数据默认保存到 %LOCALAPPDATA%\AIProxyHub（由 AIProxyHub 自身决定）
 ;
 ; 构建方式（推荐通过 scripts/build-installer-nsis.ps1 调用）：
@@ -59,7 +59,13 @@ Section "AIProxyHub（必选）" SEC_CORE
   SectionIn RO
 
   SetOutPath "$INSTDIR"
-  File "..\dist\AIProxyHub.exe"
+  !ifdef ONEDIR
+    ; PyInstaller --onedir：复制目录内所有文件
+    File /r "..\dist\AIProxyHub\*"
+  !else
+    ; PyInstaller --onefile：只需要一个 exe
+    File "..\dist\AIProxyHub.exe"
+  !endif
   File "..\使用指南.md"
   File "..\API.md"
 
@@ -96,11 +102,15 @@ Section "Uninstall"
   RMDir  "$SMPROGRAMS\${APP_NAME}"
 
   ; 删除程序文件（默认不删除用户数据目录：%LOCALAPPDATA%\AIProxyHub）
-  Delete "$INSTDIR\AIProxyHub.exe"
-  Delete "$INSTDIR\使用指南.md"
-  Delete "$INSTDIR\API.md"
-  Delete "$INSTDIR\Uninstall.exe"
-  RMDir  "$INSTDIR"
+  !ifdef ONEDIR
+    RMDir /r "$INSTDIR"
+  !else
+    Delete "$INSTDIR\AIProxyHub.exe"
+    Delete "$INSTDIR\使用指南.md"
+    Delete "$INSTDIR\API.md"
+    Delete "$INSTDIR\Uninstall.exe"
+    RMDir  "$INSTDIR"
+  !endif
 
   ; 清理卸载登记
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"

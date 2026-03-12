@@ -11,6 +11,7 @@ import ctypes
 import hashlib
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -96,7 +97,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -146,6 +147,10 @@ PROXY_RESTART_KEYS = {
     "cache_ttl_seconds",
     "cache_max_entries",
     "cache_max_body_kb",
+    "cache_max_total_mb",
+    "cache_ttl_jitter_seconds",
+    "cache_stale_while_revalidate_seconds",
+    "cache_stale_if_error_seconds",
 }
 
 proxy_process = None
@@ -174,19 +179,29 @@ _cache_lock = threading.Lock()
 _cache_store = OrderedDict()  # key -> dict(entry)
 _cache_bytes = 0
 _cache_hits = 0
+_cache_stale_hits = 0
+_cache_sie_hits = 0
 _cache_misses = 0
 _cache_stores = 0
 _cache_evictions = 0
 _cache_bypass = 0
 _cache_inflight_waits = 0
-# 估算：缓存命中节省的 tokens（从缓存响应里的 usage.total_tokens 提取；缺失则为 0）
+# 估算：缓存命中“节省的 tokens”（仅统计真正 HIT 返回；STALE/SWR/SIE 可能仍会触发回源，不计入节省）。
 _cache_saved_tokens = 0
+# 估算：从缓存返回给客户端的 tokens（HIT/STALE/SIE 均计入；best-effort）
+_cache_served_tokens = 0
+_cache_swr_refreshes = 0
+_cache_swr_refresh_errors = 0
 _cache_inflight = {}  # key -> threading.Event
 _gateway_cfg = {
     "cache_enabled": False,
     "ttl_seconds": 3600,
+    "ttl_jitter_seconds": 0,
     "max_entries": 200,
     "max_body_bytes": 512 * 1024,
+    "max_total_bytes": 0,
+    "stale_while_revalidate_seconds": 0,
+    "stale_if_error_seconds": 0,
     "share_across_api_keys": False,
 }
 
@@ -346,10 +361,24 @@ def default_settings():
         "cache_vary_headers": "OpenAI-Project,OpenAI-Organization,X-AIProxyHub-Cache-Group",
         # 缓存 TTL（秒）
         "cache_ttl_seconds": 3600,
+        # TTL 抖动（秒）：写入缓存时会从 TTL 中随机减去 [0, jitter]，避免大量条目同一时刻过期造成抖动。
+        # - 0：关闭
+        # - 建议：10~60
+        "cache_ttl_jitter_seconds": 30,
         # 最大缓存条目数（LRU）
         "cache_max_entries": 200,
         # 单条缓存最大响应体大小（KB），避免大响应占满内存
         "cache_max_body_kb": 512,
+        # 缓存总内存上限（MB）；达到上限会按 LRU 继续驱逐，避免高并发下缓存把内存打爆。
+        # - 0：不限制（不推荐）
+        # - 建议：64~512
+        "cache_max_total_mb": 128,
+        # stale-while-revalidate（秒）：条目过期后，在该窗口内仍可返回旧缓存，同时后台刷新。
+        # 注意：后台刷新会产生“真实回源请求”（会消耗额度）；默认 0=关闭。
+        "cache_stale_while_revalidate_seconds": 0,
+        # stale-if-error（秒）：条目过期后，在该窗口内若回源失败/限流，可返回旧缓存兜底。
+        # 默认 0=关闭。
+        "cache_stale_if_error_seconds": 0,
     }
 
 
@@ -767,19 +796,35 @@ def _gateway_set_config_from_settings(s: dict):
     if "x-aiproxyhub-cache-group" not in vary_headers:
         vary_headers.append("x-aiproxyhub-cache-group")
     ttl = int(s.get("cache_ttl_seconds", 3600) or 3600)
+    ttl_jitter = int(s.get("cache_ttl_jitter_seconds", 0) or 0)
     max_entries = int(s.get("cache_max_entries", 200) or 200)
     max_body_kb = int(s.get("cache_max_body_kb", 512) or 512)
+    max_total_mb = int(s.get("cache_max_total_mb", 0) or 0)
+    swr = int(s.get("cache_stale_while_revalidate_seconds", 0) or 0)
+    sie = int(s.get("cache_stale_if_error_seconds", 0) or 0)
     if ttl < 1:
         ttl = 1
+    if ttl_jitter < 0:
+        ttl_jitter = 0
     if max_entries < 0:
         max_entries = 0
     if max_body_kb < 1:
         max_body_kb = 1
+    if max_total_mb < 0:
+        max_total_mb = 0
+    if swr < 0:
+        swr = 0
+    if sie < 0:
+        sie = 0
     _gateway_cfg = {
         "cache_enabled": cache_enabled,
         "ttl_seconds": ttl,
+        "ttl_jitter_seconds": ttl_jitter,
         "max_entries": max_entries,
         "max_body_bytes": max_body_kb * 1024,
+        "max_total_bytes": max_total_mb * 1024 * 1024,
+        "stale_while_revalidate_seconds": swr,
+        "stale_if_error_seconds": sie,
         "share_across_api_keys": share,
         "expected_api_keys": expected_api_keys,
         "vary_headers": vary_headers,
@@ -809,33 +854,45 @@ def _token_allowed(token: str, allow: set[str]) -> bool:
 
 
 def _cache_clear():
-    global _cache_store, _cache_bytes, _cache_hits, _cache_misses, _cache_stores, _cache_evictions, _cache_bypass, _cache_inflight_waits, _cache_saved_tokens
+    global _cache_store, _cache_bytes, _cache_hits, _cache_stale_hits, _cache_sie_hits, _cache_misses, _cache_stores, _cache_evictions, _cache_bypass, _cache_inflight_waits, _cache_saved_tokens, _cache_served_tokens, _cache_swr_refreshes, _cache_swr_refresh_errors
     with _cache_lock:
         _cache_store.clear()
         _cache_bytes = 0
         _cache_hits = 0
+        _cache_stale_hits = 0
+        _cache_sie_hits = 0
         _cache_misses = 0
         _cache_stores = 0
         _cache_evictions = 0
         _cache_bypass = 0
         _cache_inflight_waits = 0
         _cache_saved_tokens = 0
+        _cache_served_tokens = 0
+        _cache_swr_refreshes = 0
+        _cache_swr_refresh_errors = 0
         _cache_inflight.clear()
 
 
 def _cache_stats():
     with _cache_lock:
-        total = int(_cache_hits + _cache_misses) or 0
+        total = int(_cache_hits + _cache_stale_hits + _cache_sie_hits + _cache_misses) or 0
         hit_ratio = round((_cache_hits / total) * 100, 1) if total else 0.0
+        serve_ratio = round(((_cache_hits + _cache_stale_hits + _cache_sie_hits) / total) * 100, 1) if total else 0.0
         return {
             "enabled": bool(_gateway_cfg.get("cache_enabled", False)),
             "share_across_api_keys": bool(_gateway_cfg.get("share_across_api_keys", False)),
             "hits": int(_cache_hits),
+            "stale_hits": int(_cache_stale_hits),
+            "stale_if_error_hits": int(_cache_sie_hits),
             "misses": int(_cache_misses),
             "hit_ratio_pct": hit_ratio,
+            "served_ratio_pct": serve_ratio,
             # 估算节省：命中=节省 1 次回源；tokens 来自缓存写入时提取的 usage.total_tokens
             "saved_requests": int(_cache_hits),
             "saved_tokens": int(_cache_saved_tokens),
+            "served_tokens": int(_cache_served_tokens),
+            "swr_refreshes": int(_cache_swr_refreshes),
+            "swr_refresh_errors": int(_cache_swr_refresh_errors),
             "stores": int(_cache_stores),
             "evictions": int(_cache_evictions),
             "bypass": int(_cache_bypass),
@@ -843,8 +900,12 @@ def _cache_stats():
             "entries": int(len(_cache_store)),
             "bytes": int(_cache_bytes),
             "ttl_seconds": int(_gateway_cfg.get("ttl_seconds", 0) or 0),
+            "ttl_jitter_seconds": int(_gateway_cfg.get("ttl_jitter_seconds", 0) or 0),
             "max_entries": int(_gateway_cfg.get("max_entries", 0) or 0),
             "max_body_bytes": int(_gateway_cfg.get("max_body_bytes", 0) or 0),
+            "max_total_bytes": int(_gateway_cfg.get("max_total_bytes", 0) or 0),
+            "stale_while_revalidate_seconds": int(_gateway_cfg.get("stale_while_revalidate_seconds", 0) or 0),
+            "stale_if_error_seconds": int(_gateway_cfg.get("stale_if_error_seconds", 0) or 0),
             "vary_headers": list(_gateway_cfg.get("vary_headers") or []),
         }
 
@@ -897,34 +958,74 @@ def _cache_key_for_request(method: str, path: str, auth: str, body_bytes: bytes,
     return h.hexdigest()
 
 
-def _cache_get(key: str):
-    """命中返回 entry；过期会自动删除。"""
-    global _cache_hits, _cache_misses, _cache_bytes, _cache_saved_tokens
+def _cache_lookup(key: str):
+    """
+    查询缓存条目并返回分类：
+
+    返回：
+    - ("HIT", entry)：新鲜缓存（expires_at > now）
+    - ("STALE", entry)：过期但在 stale-while-revalidate 窗口内
+    - ("SIE", entry)：过期但在 stale-if-error 窗口内
+    - ("MISS", None)：未命中/硬过期（超过 hard_until，将被删除）
+
+    说明：
+    - 仅在 HIT 时计入 _cache_hits/_cache_saved_tokens/_cache_served_tokens
+    - STALE/SIE 由调用方决定是否真正“返回旧缓存”，因此不在此处计数
+    """
+    global _cache_hits, _cache_misses, _cache_bytes, _cache_saved_tokens, _cache_served_tokens
     now = time.time()
+    swr = int(_gateway_cfg.get("stale_while_revalidate_seconds", 0) or 0)
+    sie = int(_gateway_cfg.get("stale_if_error_seconds", 0) or 0)
+
     with _cache_lock:
         entry = _cache_store.get(key)
         if not entry:
             _cache_misses += 1
-            return None
-        if float(entry.get("expires_at", 0) or 0) <= now:
-            # 过期：删除并视为 miss
+            return "MISS", None
+
+        hard_until = float(entry.get("hard_until", 0) or 0)
+        if hard_until and hard_until <= now:
+            # 硬过期：删除并视为 miss
             try:
                 _cache_bytes -= int(entry.get("size", 0) or 0)
             except Exception:
                 pass
+            _cache_store.pop(key, None)
+            _cache_misses += 1
+            return "MISS", None
+
+        expires_at = float(entry.get("expires_at", 0) or 0)
+        if expires_at > now:
+            _cache_store.move_to_end(key)
+            _cache_hits += 1
             try:
-                del _cache_store[key]
+                tokens = int(entry.get("tokens", 0) or 0)
+                _cache_saved_tokens += tokens
+                _cache_served_tokens += tokens
             except Exception:
                 pass
-            _cache_misses += 1
-            return None
-        _cache_store.move_to_end(key)
-        _cache_hits += 1
+            return "HIT", entry
+
+        # 过期但仍可能“可用”（SWR/SIE 窗口）
+        stale_until = float(entry.get("stale_until", expires_at) or expires_at)
+        sie_until = float(entry.get("sie_until", expires_at) or expires_at)
+
+        if swr > 0 and stale_until > now:
+            _cache_store.move_to_end(key)
+            return "STALE", entry
+
+        if sie > 0 and sie_until > now:
+            _cache_store.move_to_end(key)
+            return "SIE", entry
+
+        # 无窗口：删除并视为 miss（理论上 hard_until==expires_at 已在上方命中）
         try:
-            _cache_saved_tokens += int(entry.get("tokens", 0) or 0)
+            _cache_bytes -= int(entry.get("size", 0) or 0)
         except Exception:
             pass
-        return entry
+        _cache_store.pop(key, None)
+        _cache_misses += 1
+        return "MISS", None
 
 
 def _extract_usage_total_tokens(body: bytes) -> int:
@@ -952,7 +1053,7 @@ def _extract_usage_total_tokens(body: bytes) -> int:
 
 
 def _cache_put(key: str, *, status: int, headers: list, body: bytes):
-    """写入缓存（LRU + TTL + max_entries + max_body_bytes）。"""
+    """写入缓存（LRU + TTL + TTL jitter + max_entries + max_body_bytes + max_total_bytes）。"""
     global _cache_bytes, _cache_stores, _cache_evictions
     if not bool(_gateway_cfg.get("cache_enabled", False)):
         return False
@@ -962,7 +1063,13 @@ def _cache_put(key: str, *, status: int, headers: list, body: bytes):
         return False
 
     max_body_bytes = int(_gateway_cfg.get("max_body_bytes", 0) or 0)
-    if max_body_bytes > 0 and len(body or b"") > max_body_bytes:
+    body_len = int(len(body or b""))
+    if max_body_bytes > 0 and body_len > max_body_bytes:
+        return False
+
+    max_total_bytes = int(_gateway_cfg.get("max_total_bytes", 0) or 0)
+    if max_total_bytes > 0 and body_len > max_total_bytes:
+        # 单条就超过总上限：直接不缓存（避免驱逐所有条目仍无法满足）
         return False
 
     ttl = int(_gateway_cfg.get("ttl_seconds", 0) or 0)
@@ -971,14 +1078,39 @@ def _cache_put(key: str, *, status: int, headers: list, body: bytes):
 
     now = time.time()
     tokens = _extract_usage_total_tokens(body or b"")
+    jitter = int(_gateway_cfg.get("ttl_jitter_seconds", 0) or 0)
+    if jitter < 0:
+        jitter = 0
+    # 按设计：从 TTL 中随机减去 [0, jitter]，避免大量条目同一时刻过期
+    if jitter > 0:
+        try:
+            jitter = min(jitter, max(0, ttl - 1))
+            ttl = max(1, ttl - int(random.randint(0, jitter)))
+        except Exception:
+            pass
+
+    expires_at = now + int(ttl)
+    swr = int(_gateway_cfg.get("stale_while_revalidate_seconds", 0) or 0)
+    sie = int(_gateway_cfg.get("stale_if_error_seconds", 0) or 0)
+    if swr < 0:
+        swr = 0
+    if sie < 0:
+        sie = 0
+    stale_until = expires_at + int(swr)
+    sie_until = expires_at + int(sie)
+    hard_until = max(stale_until, sie_until, expires_at)
+
     entry = {
         "status": int(status or 0),
         "headers": list(headers or []),
         "body": body or b"",
-        "size": int(len(body or b"")),
+        "size": body_len,
         "tokens": int(tokens or 0),
         "created_at": now,
-        "expires_at": now + ttl,
+        "expires_at": expires_at,
+        "stale_until": stale_until,
+        "sie_until": sie_until,
+        "hard_until": hard_until,
     }
 
     with _cache_lock:
@@ -1001,6 +1133,16 @@ def _cache_put(key: str, *, status: int, headers: list, body: bytes):
             except Exception:
                 pass
             _cache_evictions += 1
+
+        # 总内存上限驱逐（按 LRU）
+        if max_total_bytes > 0:
+            while _cache_store and int(_cache_bytes) > int(max_total_bytes):
+                _, victim = _cache_store.popitem(last=False)
+                try:
+                    _cache_bytes -= int(victim.get("size", 0) or 0)
+                except Exception:
+                    pass
+                _cache_evictions += 1
 
     return True
 
@@ -1159,7 +1301,7 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                     pass
 
         def _handle(self):
-            global _cache_bypass
+            global _cache_bypass, _cache_stale_hits, _cache_sie_hits, _cache_served_tokens, _cache_swr_refreshes, _cache_swr_refresh_errors
             try:
                 body = self._read_body()
             except Exception as e:
@@ -1182,6 +1324,8 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
             )
 
             if cache_candidate:
+                method = self.command
+                full_path = self.path
                 # 安全护栏：当开启“跨 API Key 共享缓存”时，缓存 key 不包含 Authorization，
                 # 若不额外校验，会导致“未授权请求也能命中缓存”。
                 if bool(_gateway_cfg.get("share_across_api_keys", False)):
@@ -1219,12 +1363,20 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 except Exception:
                     vary = []
 
-                key = _cache_key_for_request(self.command, self.path, _cache_auth_for_key(auth), body, vary=vary)
-                hit = _cache_get(key)
-                if hit:
-                    data = hit.get("body") or b""
-                    headers = hit.get("headers") or []
-                    status = int(hit.get("status", 200) or 200)
+                key = _cache_key_for_request(method, full_path, _cache_auth_for_key(auth), body, vary=vary)
+                cache_ctl = str(self.headers.get("X-AIProxyHub-Cache", "") or "").strip().lower()
+                cache_cc = str(self.headers.get("Cache-Control", "") or "").strip().lower()
+                bypass_read = False
+                no_store = False
+                if cache_ctl in ("bypass", "off", "no-store", "0") or ("no-store" in cache_cc):
+                    no_store = True
+                elif cache_ctl in ("refresh", "no-cache", "revalidate") or ("no-cache" in cache_cc):
+                    bypass_read = True
+
+                def _send_cached(entry: dict, tag: str):
+                    data = entry.get("body") or b""
+                    headers = entry.get("headers") or []
+                    status = int(entry.get("status", 200) or 200)
                     self.send_response(status)
                     for hk, hv in headers:
                         lk = str(hk or "").lower()
@@ -1233,22 +1385,167 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                         if lk in ("content-length", "transfer-encoding"):
                             continue
                         self.send_header(hk, hv)
-                    self.send_header("X-AIProxyHub-Cache", "HIT")
+                    self.send_header("X-AIProxyHub-Cache", str(tag or "HIT"))
                     self.send_header("Content-Length", str(len(data)))
                     self.end_headers()
-                    self.wfile.write(data)
+                    try:
+                        self.wfile.write(data)
+                    except Exception:
+                        pass
+
+                def _filtered_upstream_headers() -> dict:
+                    # 与 _proxy_upstream 一致：剔除 hop-by-hop、Host、Accept-Encoding、X-AIProxyHub-*
+                    req_headers = {}
+                    for k, v in (self.headers.items() or []):
+                        lk = str(k or "").lower()
+                        if lk in _HOP_BY_HOP_HEADERS:
+                            continue
+                        if lk == "host":
+                            continue
+                        if lk == "accept-encoding":
+                            continue
+                        if lk.startswith("x-aiproxyhub-"):
+                            continue
+                        req_headers[k] = v
+                    req_headers["Host"] = f"{upstream_host}:{upstream_port}"
+                    return req_headers
+
+                def _fetch_upstream_once(headers_snapshot: dict) -> tuple[int, list, bytes, str]:
+                    """
+                    仅用于缓存逻辑（SWR/SIE）：
+                    - 读取完整 body（非 SSE）
+                    - 不直接写回客户端
+                    """
+                    conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=600)
+                    try:
+                        conn.request(method, full_path, body=body, headers=headers_snapshot)
+                        resp = conn.getresponse()
+                        status = int(getattr(resp, "status", 502) or 502)
+                        headers = list(resp.getheaders() or [])
+                        content_type = ""
+                        try:
+                            for hk, hv in headers:
+                                if str(hk).lower() == "content-type":
+                                    content_type = str(hv)
+                                    break
+                        except Exception:
+                            pass
+                        if content_type.lower().startswith("text/event-stream"):
+                            return status, headers, b"", "text/event-stream"
+                        data = resp.read() or b""
+                        return status, headers, data, content_type
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                if no_store:
+                    _cache_bypass += 1
+                    self._proxy_upstream(body=body, cache_tag="BYPASS")
                     return
 
-                ev, is_leader = _cache_inflight_begin(key)
-                if not is_leader:
-                    # 等待 leader 回源并写入缓存
-                    ev.wait(timeout=90)
-                    hit2 = _cache_get(key)
-                    if hit2:
-                        data = hit2.get("body") or b""
-                        headers = hit2.get("headers") or []
-                        status = int(hit2.get("status", 200) or 200)
-                        self.send_response(status)
+                kind = "MISS"
+                entry = None
+                if not bypass_read:
+                    kind, entry = _cache_lookup(key)
+
+                if kind == "HIT" and entry:
+                    _send_cached(entry, "HIT")
+                    return
+
+                # stale-while-revalidate：直接返回旧缓存（tag=STALE），同时后台刷新
+                if kind == "STALE" and entry:
+                    with _cache_lock:
+                        _cache_stale_hits += 1
+                        try:
+                            _cache_served_tokens += int(entry.get("tokens", 0) or 0)
+                        except Exception:
+                            pass
+                    _send_cached(entry, "STALE")
+
+                    # 后台刷新（singleflight）
+                    headers_snapshot = _filtered_upstream_headers()
+                    ev, is_leader = _cache_inflight_begin(key)
+                    if is_leader:
+                        with _cache_lock:
+                            _cache_swr_refreshes += 1
+
+                        def _refresh():
+                            global _cache_swr_refresh_errors
+                            try:
+                                status, headers, data, ctype = _fetch_upstream_once(headers_snapshot)
+                                # 仅缓存成功响应；SSE 不缓存
+                                if int(status) == 200 and not str(ctype or "").lower().startswith("text/event-stream"):
+                                    _cache_put(key, status=status, headers=headers, body=data)
+                            except Exception:
+                                with _cache_lock:
+                                    _cache_swr_refresh_errors += 1
+                            finally:
+                                _cache_inflight_end(key, ev)
+
+                        threading.Thread(target=_refresh, daemon=True).start()
+                    return
+
+                # stale-if-error：尝试回源；若失败则返回旧缓存（tag=SIE）
+                if kind == "SIE" and entry:
+                    headers_snapshot = _filtered_upstream_headers()
+                    ev, is_leader = _cache_inflight_begin(key)
+                    if not is_leader:
+                        ev.wait(timeout=90)
+                        k2, e2 = _cache_lookup(key)
+                        if k2 == "HIT" and e2:
+                            _send_cached(e2, "HIT")
+                            return
+                        # leader 失败/超时：兜底返回旧缓存（仍在 SIE 窗口内才会走到此分支）
+                        with _cache_lock:
+                            _cache_sie_hits += 1
+                            try:
+                                _cache_served_tokens += int(entry.get("tokens", 0) or 0)
+                            except Exception:
+                                pass
+                        _send_cached(entry, "SIE")
+                        return
+
+                    try:
+                        status, headers, data, ctype = _fetch_upstream_once(headers_snapshot)
+                        # SSE：按原逻辑透传（不启用 SIE）
+                        if str(ctype or "").lower().startswith("text/event-stream"):
+                            _cache_bypass += 1
+                            self._proxy_upstream(body=body, cache_tag="BYPASS")
+                            return
+
+                        status_i = int(status or 0)
+                        is_error = (status_i == 0) or (status_i == 429) or (500 <= status_i <= 599) or (status_i == 502)
+                        if status_i == 200:
+                            # 回源成功：正常返回并更新缓存
+                            self.send_response(status_i)
+                            for hk, hv in headers:
+                                lk = str(hk or "").lower()
+                                if lk in _HOP_BY_HOP_HEADERS:
+                                    continue
+                                if lk in ("content-length", "transfer-encoding"):
+                                    continue
+                                self.send_header(hk, hv)
+                            self.send_header("X-AIProxyHub-Cache", "MISS")
+                            self.send_header("Content-Length", str(len(data or b"")))
+                            self.end_headers()
+                            self.wfile.write(data or b"")
+                            _cache_put(key, status=status_i, headers=headers, body=data or b"")
+                            return
+
+                        if is_error:
+                            with _cache_lock:
+                                _cache_sie_hits += 1
+                                try:
+                                    _cache_served_tokens += int(entry.get("tokens", 0) or 0)
+                                except Exception:
+                                    pass
+                            _send_cached(entry, "SIE")
+                            return
+
+                        # 非“可兜底的错误”：保持 upstream 原样返回（不缓存）
+                        self.send_response(status_i or 502)
                         for hk, hv in headers:
                             lk = str(hk or "").lower()
                             if lk in _HOP_BY_HOP_HEADERS:
@@ -1256,19 +1553,41 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                             if lk in ("content-length", "transfer-encoding"):
                                 continue
                             self.send_header(hk, hv)
-                        self.send_header("X-AIProxyHub-Cache", "HIT")
-                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("X-AIProxyHub-Cache", "MISS")
+                        self.send_header("Content-Length", str(len(data or b"")))
                         self.end_headers()
-                        self.wfile.write(data)
+                        self.wfile.write(data or b"")
+                        return
+                    except Exception:
+                        # 网络异常：可兜底返回旧缓存
+                        with _cache_lock:
+                            _cache_sie_hits += 1
+                            try:
+                                _cache_served_tokens += int(entry.get("tokens", 0) or 0)
+                            except Exception:
+                                pass
+                        _send_cached(entry, "SIE")
+                        return
+                    finally:
+                        _cache_inflight_end(key, ev)
+
+                # ===== MISS / REFRESH =====
+                ev, is_leader = _cache_inflight_begin(key)
+                if not is_leader:
+                    # 等待 leader 回源并写入缓存
+                    ev.wait(timeout=90)
+                    k2, e2 = _cache_lookup(key)
+                    if k2 == "HIT" and e2:
+                        _send_cached(e2, "HIT")
                         return
                     # leader 失败/超时：降级为普通透传（不再强行等待）
                     _cache_bypass += 1
-                    self._proxy_upstream(body=body)
+                    self._proxy_upstream(body=body, cache_tag="BYPASS")
                     return
 
                 try:
-                    r = self._proxy_upstream(body=body)
-                    if isinstance(r, tuple) and len(r) == 3:
+                    r = self._proxy_upstream(body=body, cache_tag=("MISS" if bypass_read else "MISS"))
+                    if isinstance(r, tuple) and len(r) == 3 and not no_store:
                         status, headers, data = r
                         # 仅缓存成功响应（避免把 401/429/5xx 缓存住）
                         if int(status) == 200:
@@ -2399,11 +2718,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 	    <div class="check-row"><input type="checkbox" id="s-cache_shared_across_api_keys"><label for="s-cache_shared_across_api_keys">跨 API Key 共享缓存（仅可信环境）</label></div>
 	    <div class="form-grid three" style="margin-top:12px">
 	      <div class="form-group"><label>缓存 TTL（秒）</label><input id="s-cache_ttl_seconds" type="number"></div>
+	      <div class="form-group"><label>TTL 抖动（秒）</label><input id="s-cache_ttl_jitter_seconds" type="number"></div>
+	      <div class="form-group"><label>总内存上限（MB）</label><input id="s-cache_max_total_mb" type="number"></div>
+	    </div>
+	    <div class="form-grid three" style="margin-top:12px">
 	      <div class="form-group"><label>最大条目数</label><input id="s-cache_max_entries" type="number"></div>
 	      <div class="form-group"><label>单条最大大小（KB）</label><input id="s-cache_max_body_kb" type="number"></div>
+	      <div class="form-group"><label>SWR（秒）</label><input id="s-cache_stale_while_revalidate_seconds" type="number"></div>
+	    </div>
+	    <div class="form-grid three" style="margin-top:12px">
+	      <div class="form-group"><label>SIE（秒）</label><input id="s-cache_stale_if_error_seconds" type="number"></div>
+	      <div class="form-group full"><label>Vary Headers（逗号分隔）</label><input id="s-cache_vary_headers" type="text"></div>
 	    </div>
     <div class="hint" style="margin-top:10px">
-      注意：修改该配置后需要重启代理才会生效；如代理正在运行，可在仪表盘点击「重启代理」立即应用（会短暂中断连接）。
+      注意：修改该配置后需要重启代理才会生效；如代理正在运行，可在仪表盘点击「重启代理」立即应用（会短暂中断连接）。<br>
+      请求级控制：<code>X-AIProxyHub-Cache: bypass</code> 禁用读写缓存；<code>X-AIProxyHub-Cache: refresh</code> 跳过读取并强制回源更新缓存。
     </div>
   </div>
   <div class="btn-row">
@@ -2514,9 +2843,22 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 const API_TOKEN="__API_TOKEN__";
 const $=id=>document.getElementById(id);
 function esc(s){const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
-const fields=['duckmail_token','proxy','total_accounts','max_workers','management_password','api_key','proxy_port','proxy_host','routing_strategy','request_retry','cache_ttl_seconds','cache_max_entries','cache_max_body_kb'];
+const fields=[
+  'duckmail_token','proxy','total_accounts','max_workers','management_password','api_key',
+  'proxy_port','proxy_host','routing_strategy','request_retry',
+  // cache pool
+  'cache_vary_headers',
+  'cache_ttl_seconds','cache_ttl_jitter_seconds',
+  'cache_max_entries','cache_max_body_kb','cache_max_total_mb',
+  'cache_stale_while_revalidate_seconds','cache_stale_if_error_seconds'
+];
 const checks=['quota_switch_project','quota_switch_preview','debug','store_passwords','write_ak_rk','keep_token_json','keep_token_json_on_fail','gateway_enabled','cache_enabled','cache_shared_across_api_keys'];
-const intFields=new Set(['total_accounts','max_workers','proxy_port','request_retry','cache_ttl_seconds','cache_max_entries','cache_max_body_kb']);
+const intFields=new Set([
+  'total_accounts','max_workers','proxy_port','request_retry',
+  'cache_ttl_seconds','cache_ttl_jitter_seconds',
+  'cache_max_entries','cache_max_body_kb','cache_max_total_mb',
+  'cache_stale_while_revalidate_seconds','cache_stale_if_error_seconds'
+]);
 const secretFields=new Set(['duckmail_token','management_password','api_key']);
 let settingsCache=null;
 let usageTick=0;

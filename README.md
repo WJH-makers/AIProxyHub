@@ -15,6 +15,7 @@ AIProxyHub 是一个面向 Windows 的“一键整合”工具：把 **CLIProxyA
   - 覆盖 `/v1/responses` 与 `/v1/chat/completions`（非 stream）
   - 支持 **跨 API Key 共享缓存**（仅可信团队场景，默认关闭）
   - singleflight 防止 cache stampede
+  - 支持 TTL 抖动 / 总内存上限 / stale-while-revalidate / stale-if-error（高级）
 - **EXE 发布包冒烟**：验证 EXE 可运行、鉴权、代理、usage、缓存命中，并支持 20 RPS（缓存 HIT 路径）压测
 
 ## 数据保存（EXE/安装版）

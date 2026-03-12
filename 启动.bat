@@ -7,7 +7,7 @@ set "PYTHONIOENCODING=utf-8"
 set "PIP_DISABLE_PIP_VERSION_CHECK=1"
 echo.
 echo   ╔══════════════════════════════════╗
-echo   ║       AIProxyHub v1.2.2          ║
+echo   ║       AIProxyHub v1.2.6          ║
 echo   ║   ChatGPT 注册 + 代理 一体化    ║
 echo   ╚══════════════════════════════════╝
 echo.
