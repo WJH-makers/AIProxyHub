@@ -34,7 +34,8 @@ try {
   $releaseDir = Join-Path $root "release"
   New-Item -ItemType Directory -Force $releaseDir | Out-Null
 
-  $out = Join-Path $releaseDir ("AIProxyHub-$ver-setup-win64.exe")
+  $suffix = if ($OneDir) { "-setup-win64-onedir.exe" } else { "-setup-win64.exe" }
+  $out = Join-Path $releaseDir ("AIProxyHub-$ver$suffix")
   $nsi = Join-Path $root "installer\\AIProxyHub.nsi"
   if (-not (Test-Path $nsi)) { throw "未找到 NSIS 脚本：$nsi" }
 

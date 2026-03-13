@@ -41,7 +41,7 @@ RequestExecutionLevel user
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
-!insertmacro MUI_PAGE_COMPONENTS
+; 为了更接近“QQ/微信一键安装即用”的体验，这里不提供组件勾选页：默认总是创建桌面/开始菜单快捷方式
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -106,6 +106,8 @@ Section "Uninstall"
     RMDir /r "$INSTDIR"
   !else
     Delete "$INSTDIR\AIProxyHub.exe"
+    ; PyInstaller onefile 运行后会在同目录生成 _internal（依赖解包目录），卸载时一并清理
+    RMDir /r "$INSTDIR\_internal"
     Delete "$INSTDIR\使用指南.md"
     Delete "$INSTDIR\API.md"
     Delete "$INSTDIR\Uninstall.exe"

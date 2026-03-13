@@ -97,7 +97,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -142,6 +142,8 @@ PROXY_RESTART_KEYS = {
     # 网关/缓存池
     "gateway_enabled",
     "cache_enabled",
+    # 是否对 stream=true 的 SSE/WS 做缓存（命中时“快速回放”）；开关变化需要重启网关生效
+    "cache_stream_enabled",
     "cache_shared_across_api_keys",
     "cache_vary_headers",
     "cache_ttl_seconds",
@@ -163,6 +165,134 @@ _log_lock = threading.Lock()
 _lock = threading.RLock()
 autopilot_cancel = threading.Event()
 _UI_API_TOKEN = secrets.token_urlsafe(24)
+
+# ----------------------------
+# 单实例（Windows EXE 默认启用）
+# ----------------------------
+
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def _is_frozen_exe() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _windows_message_box(text: str, title: str = "AIProxyHub"):
+    """在 Windows 上弹一个信息框；失败时静默。"""
+    if not _is_windows():
+        return
+    try:
+        MB_OK = 0x00000000
+        MB_ICONINFORMATION = 0x00000040
+        ctypes.windll.user32.MessageBoxW(0, str(text), str(title), MB_OK | MB_ICONINFORMATION)
+    except Exception:
+        pass
+
+
+def _single_instance_mutex_name() -> str:
+    """
+    生成单实例互斥体名（按 ROOT 分区）。
+
+    说明：
+    - 默认使用“全局单实例”（避免安装版/便携版/旧版本同时运行，导致端口冲突与管理密码不一致，从而出现黑框闪退/面板数据为空等误判）。
+    - 若显式设置 AIPROXYHUB_HOME（例如冒烟脚本/隔离运行），则按 ROOT 分区允许多实例并存。
+    """
+    # 显式隔离：允许多实例并存（按 ROOT 分区）
+    env_home = str(os.getenv("AIPROXYHUB_HOME", "") or "").strip()
+    if env_home:
+        root = os.path.abspath(str(ROOT or "")).lower().encode("utf-8", errors="ignore")
+        h = hashlib.sha1(root).hexdigest()[:12]
+        return f"Local\\AIProxyHub_{h}"
+    # 默认：全局单实例
+    return "Local\\AIProxyHub"
+
+
+def _acquire_single_instance_mutex() -> bool:
+    """
+    尝试获取单实例互斥体。
+
+    返回：
+    - True: 本进程为唯一实例（或无法获取但 fail-open）
+    - False: 已存在另一个实例
+    """
+    global _SINGLE_INSTANCE_MUTEX
+    if not _is_windows():
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.GetLastError.restype = wintypes.DWORD
+
+        name = _single_instance_mutex_name()
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            # 无法创建互斥体：保守 fail-open，避免把用户卡死
+            return True
+        _SINGLE_INSTANCE_MUTEX = handle
+        # ERROR_ALREADY_EXISTS = 183
+        return int(kernel32.GetLastError() or 0) != 183
+    except Exception:
+        return True
+
+
+def _launcher_port_file() -> str:
+    return os.path.join(ROOT, "launcher.port")
+
+
+def _write_launcher_port_file(port: int):
+    if not _is_frozen_exe():
+        return
+    try:
+        os.makedirs(ROOT, exist_ok=True)
+        with open(_launcher_port_file(), "w", encoding="utf-8") as f:
+            f.write(str(int(port)))
+    except Exception:
+        pass
+
+
+def _read_launcher_port_file() -> int:
+    try:
+        with open(_launcher_port_file(), "r", encoding="utf-8") as f:
+            v = f.read().strip()
+        return int(v)
+    except Exception:
+        return 0
+
+
+def _probe_launcher_port(port: int) -> bool:
+    """检查指定端口是否存在正在运行的 launcher（用于单实例场景下的“打开已运行窗口”）。"""
+    try:
+        import urllib.request
+        import urllib.error
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/api/status", timeout=0.35) as r:
+            code = int(getattr(r, "status", 0) or 0)
+        return 200 <= code < 300
+    except urllib.error.HTTPError as e:
+        # 只要能连上并返回 JSON/HTML，就说明该端口确实被占用（但不一定是 AIProxyHub）
+        try:
+            return int(getattr(e, "code", 0) or 0) in (200, 401, 403)
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _discover_existing_launcher_port(preferred: list[int]) -> int:
+    """从一组候选端口中发现正在运行的 launcher 端口；找不到则返回 0。"""
+    seen = set()
+    for p in (preferred or []):
+        try:
+            p = int(p or 0)
+        except Exception:
+            p = 0
+        if p <= 0 or p in seen:
+            continue
+        seen.add(p)
+        if _probe_launcher_port(p):
+            return p
+    return 0
 
 # ===== 透明网关（cache-front）+ 缓存池（跨账号节省额度）=====
 # 说明：
@@ -195,6 +325,7 @@ _cache_swr_refresh_errors = 0
 _cache_inflight = {}  # key -> threading.Event
 _gateway_cfg = {
     "cache_enabled": False,
+    "cache_stream_enabled": False,
     "ttl_seconds": 3600,
     "ttl_jitter_seconds": 0,
     "max_entries": 200,
@@ -244,9 +375,32 @@ def log(msg):
         pass
 
 
+def _tail_log_lines(contains: str, n: int = 12) -> list[str]:
+    """
+    从内存日志里取最后 N 行（仅用于错误提示/诊断，不用于持久化）。
+
+    - contains: 仅保留包含该子串的行（例如 "[PROXY]"）
+    - n: 返回行数上限
+    """
+    try:
+        n = int(n or 0)
+    except Exception:
+        n = 12
+    if n <= 0:
+        n = 12
+    with _log_lock:
+        lines = list(log_lines)
+    if contains:
+        lines = [x for x in lines if contains in str(x)]
+    return lines[-n:]
+
+
 # 兼容旧版弱默认值（仅用于识别与拦截，不再作为默认发放）
+#
+# 注意：旧版本曾出现过“很短的 sk- 形态 key”（非 OpenAI 官方 key）。
+# 为避免把任何可能仍在使用的真实 key 以明文写入仓库，这里不再保留具体字符串，
+# 仅通过“长度阈值”等规则把弱 key 拦下（尤其是非本机回环监听时）。
 LEGACY_DEFAULT_MANAGEMENT_PASSWORD = "cpa123456"
-LEGACY_DEFAULT_API_KEY = "sk-myproxy-001"
 
 
 def _generate_default_management_password() -> str:
@@ -351,6 +505,11 @@ def default_settings():
         "gateway_enabled": False,
         # 是否启用响应缓存（仅网关模式生效；默认关闭以避免意外缓存敏感提示词/结果）
         "cache_enabled": False,
+        # 是否允许对 stream=true 的响应做缓存（SSE/WS）。
+        # - 默认关闭：保持“流式传输只做转发、不落盘/不缓存”的直觉语义
+        # - 开启后：对完全相同的请求可直接从缓存“快速回放”，显著降低重复任务的端到端耗时
+        # 注意：这会把流式响应内容写入内存缓存池；仅建议在可信环境/明确接受缓存语义时开启。
+        "cache_stream_enabled": False,
         # 是否跨不同客户端 API Key 共享缓存（默认更安全：按 API Key 隔离）
         # - False: cache key 包含 Authorization header（不同调用方互不影响）
         # - True:  cache key 不包含 Authorization header（适合“同一团队/同一批任务”共享缓存节省额度）
@@ -642,14 +801,52 @@ routing:
 
 oauth-model-alias:
   codex:
+    # 兼容“模型名携带推理档位”的客户端配置（例如 gpt5.2-codex-high / gpt5.2-xhigh）。
+    #
+    # 约定：
+    # - gpt5.2-codex-high  → gpt-5.2-codex（并通过 payload.override 固定为 high）
+    # - gpt5.2-xhigh       → gpt-5.2（并通过 payload.override 固定为 xhigh）
+    #
+    # 备注：是否允许 codex 模型使用 xhigh 由上游决定；AIProxyHub 不在网关层强制降级推理档位，
+    # 只对“别名模型”做固定覆盖，避免客户端误传导致语义漂移。
     - name: "gpt-5.2-codex"
       alias: "gpt-5.2-codex-full"
+    # codex-high（两种写法：带/不带 gpt- 前缀分隔符）
+    - name: "gpt-5.2-codex"
+      alias: "gpt5.2-codex-high"
+      fork: true
+    - name: "gpt-5.2-codex"
+      alias: "gpt-5.2-codex-high"
+      fork: true
+    # xhigh（路由到 openai 模型 gpt-5.2）
+    - name: "gpt-5.2"
+      alias: "gpt5.2-xhigh"
+      fork: true
+    - name: "gpt-5.2"
+      alias: "gpt-5.2-xhigh"
+      fork: true
     - name: "gpt-5.1-codex-mini"
       alias: "gpt-5.2-codex"
 
 oauth-excluded-models:
   codex:
     - "gpt-5.1-codex-max"
+
+payload:
+  # 仅对“档位写进模型名”的别名做强制归一：
+  # - gpt5.2-codex-high / gpt-5.2-codex-high 固定为 high，避免客户端误传 xhigh 导致 400。
+  # - gpt5.2-xhigh / gpt-5.2-xhigh 固定为 xhigh，保证该别名语义稳定。
+  override:
+    - models:
+        - name: "gpt5.2-codex-high"
+        - name: "gpt-5.2-codex-high"
+      params:
+        "reasoning.effort": "high"
+    - models:
+        - name: "gpt5.2-xhigh"
+        - name: "gpt-5.2-xhigh"
+      params:
+        "reasoning.effort": "xhigh"
 '''
     with open(path, "w", encoding="utf-8") as f:
         f.write(yaml)
@@ -733,14 +930,12 @@ def preflight(kind: str, s: dict):
                 legacy_values=(LEGACY_DEFAULT_MANAGEMENT_PASSWORD,),
             )
             client_keys = _get_all_client_api_keys(s)
-            weak_client_key = any(
-                _is_weak_secret(k, min_len=16, legacy_values=(LEGACY_DEFAULT_API_KEY,)) for k in (client_keys or [])
-            )
+            weak_client_key = any(_is_weak_secret(k, min_len=16) for k in (client_keys or []))
             admin_key = str(s.get("admin_api_key", "") or "").strip()
             weak_admin_key = bool(admin_key) and _is_weak_secret(
                 admin_key,
                 min_len=16,
-                legacy_values=(LEGACY_DEFAULT_API_KEY,),
+                legacy_values=(),
             )
             mgmt = str(s.get("management_password", "") or "").strip()
             reused = False
@@ -786,6 +981,7 @@ def _gateway_set_config_from_settings(s: dict):
     """从 settings 生成网关配置（仅 start_proxy 时调用）。"""
     global _gateway_cfg
     cache_enabled = bool(s.get("cache_enabled", False))
+    cache_stream_enabled = bool(s.get("cache_stream_enabled", False))
     share = bool(s.get("cache_shared_across_api_keys", False))
     # 重要：透明网关在“缓存命中”时会短路 upstream（不再触发 CLIProxyAPI 的鉴权逻辑）。
     # 因此网关自身必须知道“哪些客户端 API Key 是合法的”，以避免 share_across_api_keys=True 时
@@ -818,6 +1014,7 @@ def _gateway_set_config_from_settings(s: dict):
         sie = 0
     _gateway_cfg = {
         "cache_enabled": cache_enabled,
+        "cache_stream_enabled": cache_stream_enabled,
         "ttl_seconds": ttl,
         "ttl_jitter_seconds": ttl_jitter,
         "max_entries": max_entries,
@@ -880,6 +1077,7 @@ def _cache_stats():
         serve_ratio = round(((_cache_hits + _cache_stale_hits + _cache_sie_hits) / total) * 100, 1) if total else 0.0
         return {
             "enabled": bool(_gateway_cfg.get("cache_enabled", False)),
+            "stream_enabled": bool(_gateway_cfg.get("cache_stream_enabled", False)),
             "share_across_api_keys": bool(_gateway_cfg.get("share_across_api_keys", False)),
             "hits": int(_cache_hits),
             "stale_hits": int(_cache_stale_hits),
@@ -1170,6 +1368,217 @@ def _cache_inflight_end(key: str, ev: threading.Event):
             _cache_inflight.pop(key, None)
 
 
+# ----------------------------
+# WebSocket helpers（/v1/responses WebSocket mode）
+# ----------------------------
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept_key(sec_websocket_key: str) -> str:
+    """计算 RFC6455 Sec-WebSocket-Accept。"""
+    raw = (str(sec_websocket_key or "") + _WS_GUID).encode("utf-8", errors="ignore")
+    return base64.b64encode(hashlib.sha1(raw).digest()).decode("ascii", errors="ignore")
+
+
+def _read_exact(reader, n: int) -> bytes:
+    """从 reader 读取 n 字节；不足则抛 EOFError。"""
+    n = int(n or 0)
+    if n <= 0:
+        return b""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = reader.read(n - len(buf))
+        if not chunk:
+            raise EOFError("unexpected EOF while reading websocket frame")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _ws_send_frame(writer, opcode: int, payload: bytes = b""):
+    """发送单个 WebSocket frame（服务端 -> 客户端，不做 mask）。"""
+    if payload is None:
+        payload = b""
+    payload = bytes(payload)
+    ln = len(payload)
+
+    header = bytearray()
+    header.append(0x80 | (int(opcode) & 0x0F))  # FIN + opcode
+    if ln <= 125:
+        header.append(ln)
+    elif ln <= 65535:
+        header.append(126)
+        header.extend(int(ln).to_bytes(2, "big"))
+    else:
+        header.append(127)
+        header.extend(int(ln).to_bytes(8, "big"))
+
+    writer.write(bytes(header))
+    if payload:
+        writer.write(payload)
+    try:
+        writer.flush()
+    except Exception:
+        pass
+
+
+def _ws_send_text(writer, text: str):
+    _ws_send_frame(writer, 0x1, str(text or "").encode("utf-8", errors="replace"))
+
+
+def _ws_send_close(writer, code: int = 1000, reason: str = ""):
+    payload = b""
+    try:
+        payload = int(code).to_bytes(2, "big") + str(reason or "").encode("utf-8", errors="replace")
+    except Exception:
+        payload = b""
+    _ws_send_frame(writer, 0x8, payload)
+
+
+def _ws_recv_frame(reader):
+    """接收单个 WebSocket frame（客户端 -> 服务端，通常带 mask）。"""
+    b1, b2 = _read_exact(reader, 2)
+    fin = bool(b1 & 0x80)
+    opcode = int(b1 & 0x0F)
+    masked = bool(b2 & 0x80)
+    ln = int(b2 & 0x7F)
+    if ln == 126:
+        ln = int.from_bytes(_read_exact(reader, 2), "big")
+    elif ln == 127:
+        ln = int.from_bytes(_read_exact(reader, 8), "big")
+
+    mask = _read_exact(reader, 4) if masked else b""
+    payload = _read_exact(reader, ln) if ln else b""
+    if masked and payload:
+        payload = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
+    return fin, opcode, payload
+
+
+def _ws_recv_message(reader, writer):
+    """
+    接收一个“消息级”载荷（自动处理 ping/pong 与分片）。
+
+    返回：(opcode, payload_bytes) 或 (None, b"") 表示对端关闭/无更多数据。
+    - opcode: 0x1 text, 0x2 binary
+    """
+    msg_opcode = None
+    chunks = []
+    while True:
+        try:
+            fin, opcode, payload = _ws_recv_frame(reader)
+        except EOFError:
+            return None, b""
+        except Exception:
+            return None, b""
+
+        # 控制帧
+        if opcode == 0x8:  # close
+            try:
+                _ws_send_close(writer, 1000, "")
+            except Exception:
+                pass
+            return None, b""
+        if opcode == 0x9:  # ping
+            try:
+                _ws_send_frame(writer, 0xA, payload)
+            except Exception:
+                pass
+            continue
+        if opcode == 0xA:  # pong
+            continue
+
+        # 数据帧
+        if opcode != 0x0:
+            msg_opcode = opcode
+        if payload:
+            chunks.append(payload)
+        if fin:
+            break
+
+    if msg_opcode not in (0x1, 0x2):
+        # 仅支持 text/binary
+        return None, b""
+    return msg_opcode, b"".join(chunks)
+
+
+def _iter_sse_data_strings(resp) -> "list[str]":
+    """
+    把上游 SSE（text/event-stream）解析为 data 字段字符串序列。
+
+    说明：
+    - OpenAI Responses streaming 的 data 行通常为单行 JSON（含 type 字段）。
+    - 这里不依赖 event: 行，按空行分隔 event block。
+    """
+    buf = b""
+    while True:
+        chunk = resp.read(8192)
+        if not chunk:
+            break
+        buf += chunk
+
+        while True:
+            i_lf = buf.find(b"\n\n")
+            i_crlf = buf.find(b"\r\n\r\n")
+            if i_lf == -1 and i_crlf == -1:
+                break
+            if i_crlf != -1 and (i_lf == -1 or i_crlf < i_lf):
+                block = buf[:i_crlf]
+                buf = buf[i_crlf + 4 :]
+            else:
+                block = buf[:i_lf]
+                buf = buf[i_lf + 2 :]
+
+            try:
+                text = block.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+
+            data_lines = []
+            for line in text.splitlines():
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+            if not data_lines:
+                continue
+            data = "\n".join(data_lines).strip()
+            if data:
+                yield data
+
+
+def _sanitize_responses_body_bytes(body: bytes) -> bytes:
+    """
+    对 /v1/responses 请求体做最小必要归一：
+    - 移除 CLIProxyAPI 暂不支持的 tool 类型（例如 image_generation）
+    - 若 tool_choice 指向被移除的工具则清掉，避免二次校验失败
+    """
+    if not body:
+        return body
+    try:
+        obj = json.loads(body.decode("utf-8", errors="replace"))
+        if not isinstance(obj, dict):
+            return body
+        changed = False
+        tools = obj.get("tools")
+        if isinstance(tools, list):
+            new_tools = []
+            removed = 0
+            for t in tools:
+                if isinstance(t, dict) and str(t.get("type") or "") == "image_generation":
+                    removed += 1
+                    continue
+                new_tools.append(t)
+            if removed > 0:
+                obj["tools"] = new_tools
+                tc = obj.get("tool_choice")
+                if isinstance(tc, dict) and str(tc.get("type") or "") == "image_generation":
+                    obj.pop("tool_choice", None)
+                changed = True
+        if changed:
+            return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return body
+    return body
+
+
 def _make_gateway_handler(upstream_host: str, upstream_port: int):
     upstream_host = str(upstream_host or "127.0.0.1").strip() or "127.0.0.1"
     upstream_port = int(upstream_port or 0)
@@ -1208,7 +1617,7 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 raise ValueError("请求体过大（>10MB），已拒绝")
             return self.rfile.read(length)
 
-        def _proxy_upstream(self, *, body: bytes, cache_tag: str | None = None):
+        def _proxy_upstream(self, *, body: bytes, cache_tag: str | None = None, capture_stream: bool = False):
             # 复制请求头（剔除 hop-by-hop；并重写 Host）
             req_headers = {}
             for k, v in (self.headers.items() or []):
@@ -1220,11 +1629,16 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 # 让 upstream 返回“可缓存的稳定形态”：避免 gzip 等压缩导致不同客户端 Accept-Encoding 互相影响命中率
                 if lk == "accept-encoding":
                     continue
+                # 网关可能会对 body 做轻度改写（例如归一 reasoning.effort），
+                # 若继续透传客户端的 Content-Length，会导致上游读取长度不一致而挂起/报错。
+                if lk in ("content-length", "transfer-encoding"):
+                    continue
                 # AIProxyHub 自定义控制头不需要转发给 upstream（避免污染其日志/行为）
                 if lk.startswith("x-aiproxyhub-"):
                     continue
                 req_headers[k] = v
             req_headers["Host"] = f"{upstream_host}:{upstream_port}"
+            req_headers["Content-Length"] = str(len(body or b""))
 
             conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=600)
             try:
@@ -1254,7 +1668,7 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 except Exception:
                     pass
 
-                # SSE/长连接：边读边转发（不缓存）
+                # SSE/长连接：边读边转发（可选捕获用于 stream 缓存）
                 if content_type.lower().startswith("text/event-stream"):
                     self.send_response(status)
                     for hk, hv in headers:
@@ -1268,15 +1682,32 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                     self.send_header("Connection", "close")
                     self.end_headers()
                     self.close_connection = True
+                    cap = bytearray() if bool(capture_stream) else None
+                    # 捕获上限：沿用网关缓存的单条上限；超过则停止捕获（仍继续转发）
+                    max_body_bytes = int(_gateway_cfg.get("max_body_bytes", 0) or 0)
+                    stream_ok = True
                     while True:
                         chunk = resp.read(8192)
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
+                        if cap is not None:
+                            if max_body_bytes <= 0 or (len(cap) + len(chunk) <= max_body_bytes):
+                                cap.extend(chunk)
+                            else:
+                                cap = None
+                        try:
+                            self.wfile.write(chunk)
+                        except Exception:
+                            stream_ok = False
+                            break
                         try:
                             self.wfile.flush()
                         except Exception:
-                            pass
+                            stream_ok = False
+                            break
+                    # 仅当“确实成功转发完整 SSE”且未超上限时，才把流式内容返回给调用方用于写入缓存
+                    if bool(capture_stream) and stream_ok and cap is not None:
+                        return status, headers, bytes(cap)
                     return
 
                 data = resp.read() or b""
@@ -1300,6 +1731,285 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 except Exception:
                     pass
 
+        def _handle_responses_websocket(self, *, auth_header: str):
+            """
+            /v1/responses WebSocket mode（与 OpenAI 官方“WebSocket mode”一致）：
+            - 客户端发送：{"type":"response.create","response":{...}}
+            - 服务端返回：与 SSE streaming 相同的 event 模型（逐条 JSON）
+            """
+            ws_key = str(self.headers.get("Sec-WebSocket-Key", "") or "").strip()
+            if not ws_key:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                msg = json.dumps({"error": "缺少 Sec-WebSocket-Key"}, ensure_ascii=False).encode("utf-8")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                try:
+                    self.wfile.write(msg)
+                except Exception:
+                    pass
+                return
+
+            accept = _ws_accept_key(ws_key)
+            self.send_response(101, "Switching Protocols")
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", accept)
+            # 若客户端请求了 subprotocol，尽量回显第一个（Codex 当前通常不需要）
+            proto = str(self.headers.get("Sec-WebSocket-Protocol", "") or "").strip()
+            if proto:
+                try:
+                    self.send_header("Sec-WebSocket-Protocol", proto.split(",")[0].strip())
+                except Exception:
+                    pass
+            self.end_headers()
+            self.close_connection = True
+
+            try:
+                log(f"[GW][WS] /v1/responses connected from {self.client_address[0]}:{self.client_address[1]}")
+            except Exception:
+                pass
+
+            def _send_error(status: int, body_text: str):
+                try:
+                    _ws_send_text(
+                        self.wfile,
+                        json.dumps(
+                            {"type": "error", "error": {"status": int(status), "message": str(body_text or "")}},
+                            ensure_ascii=False,
+                        ),
+                    )
+                except Exception:
+                    pass
+
+            while True:
+                opcode, payload = _ws_recv_message(self.rfile, self.wfile)
+                if opcode is None:
+                    break
+                # 只处理 text；binary 直接忽略
+                if opcode != 0x1:
+                    continue
+                try:
+                    text = payload.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                if not str(text or "").strip():
+                    continue
+
+                try:
+                    msg = json.loads(text)
+                except Exception:
+                    _send_error(400, "invalid json")
+                    continue
+                if not isinstance(msg, dict):
+                    _send_error(400, "invalid message shape")
+                    continue
+
+                mtype = str(msg.get("type") or "").strip()
+                if mtype != "response.create":
+                    # 当前仅实现 Codex 需要的 response.create（其余事件忽略即可）
+                    continue
+
+                resp_obj = msg.get("response")
+                if not isinstance(resp_obj, dict):
+                    _send_error(400, "missing response object")
+                    continue
+
+                # WebSocket mode 本身不需要 stream/background 字段；但上游 SSE 需要 stream=true
+                req_obj = dict(resp_obj)
+                req_obj.pop("background", None)
+                req_obj["stream"] = True
+
+                try:
+                    body = json.dumps(req_obj, ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    _send_error(400, "response object not serializable")
+                    continue
+                body = _sanitize_responses_body_bytes(body)
+
+                # ---- WebSocket stream 缓存（可选）----
+                # 说明：
+                # - WS mode 的 payload 本质上仍是 Responses SSE 事件流；这里缓存的是“逐条 JSON 事件（按行分隔）”。
+                # - 命中缓存时会快速回放整条事件流（不会逐 token 实时等待上游），因此更适合“重复任务/重复压测”场景。
+                cache_ws_enabled = bool(_gateway_cfg.get("cache_enabled", False)) and bool(
+                    _gateway_cfg.get("cache_stream_enabled", False)
+                )
+                cache_key_ws = ""
+                allow_read = False
+                allow_write = False
+
+                if cache_ws_enabled:
+                    # 与 HTTP 路径保持一致：允许通过 X-AIProxyHub-Cache/Cache-Control 控制 WS 缓存语义
+                    cache_ctl = str(self.headers.get("X-AIProxyHub-Cache", "") or "").strip().lower()
+                    cache_cc = str(self.headers.get("Cache-Control", "") or "").strip().lower()
+                    bypass_read = False
+                    no_store = False
+                    if cache_ctl in ("bypass", "off", "0"):
+                        bypass_read = True
+                        no_store = True
+                    elif cache_ctl == "no-store" or ("no-store" in cache_cc):
+                        no_store = True
+                    elif cache_ctl in ("refresh", "no-cache", "revalidate") or ("no-cache" in cache_cc):
+                        bypass_read = True
+
+                    allow_read = not bypass_read
+                    allow_write = not no_store
+
+                if allow_read or allow_write:
+                    try:
+                        # 安全护栏：当开启“跨 API Key 共享缓存”时，必须先校验 token，避免未授权命中缓存
+                        if bool(_gateway_cfg.get("share_across_api_keys", False)):
+                            expected = _gateway_cfg.get("expected_api_keys") or set()
+                            if expected:
+                                token = _extract_bearer_token(auth_header)
+                                if not _token_allowed(token, expected):
+                                    allow_read = False
+                                    allow_write = False
+
+                        if allow_read or allow_write:
+                            vary = []
+                            try:
+                                hm = {str(k).lower(): str(v) for k, v in (self.headers.items() or [])}
+                                for hn in (_gateway_cfg.get("vary_headers") or []):
+                                    ln = str(hn or "").strip().lower()
+                                    if not ln:
+                                        continue
+                                    vary.append((ln, hm.get(ln, "")))
+                            except Exception:
+                                vary = []
+
+                            cache_key_ws = _cache_key_for_request(
+                                "POST",
+                                "/v1/responses#ws",
+                                _cache_auth_for_key(auth_header),
+                                body,
+                                vary=vary,
+                            )
+
+                            if allow_read:
+                                kind, entry = _cache_lookup(cache_key_ws)
+                                if kind == "HIT" and entry:
+                                    raw = entry.get("body") or b""
+                                    try:
+                                        text = raw.decode("utf-8", errors="replace")
+                                    except Exception:
+                                        text = ""
+                                    for line in (text.splitlines() or []):
+                                        if not str(line or "").strip():
+                                            continue
+                                        try:
+                                            _ws_send_text(self.wfile, line)
+                                        except Exception:
+                                            break
+                                    continue
+                    except Exception:
+                        # 任意缓存异常都应降级为直连回源，避免影响 WS 基本可用性
+                        allow_read = False
+                        allow_write = False
+                        cache_key_ws = ""
+
+                # 透传 Authorization 到 upstream（CLIProxyAPI 会负责鉴权）
+                req_headers = {
+                    "Host": f"{upstream_host}:{upstream_port}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "Content-Length": str(len(body or b"")),
+                }
+                if str(auth_header or "").strip():
+                    req_headers["Authorization"] = str(auth_header)
+
+                conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=600)
+                try:
+                    try:
+                        conn.request("POST", "/v1/responses", body=body, headers=req_headers)
+                        resp = conn.getresponse()
+                    except Exception as e:
+                        _send_error(502, f"upstream unavailable: {e}")
+                        continue
+
+                    status = int(getattr(resp, "status", 502) or 502)
+                    content_type = ""
+                    try:
+                        for hk, hv in (resp.getheaders() or []):
+                            if str(hk).lower() == "content-type":
+                                content_type = str(hv)
+                                break
+                    except Exception:
+                        content_type = ""
+
+                    if not str(content_type).lower().startswith("text/event-stream"):
+                        raw = b""
+                        try:
+                            raw = resp.read() or b""
+                        except Exception:
+                            raw = b""
+                        _send_error(status, raw.decode("utf-8", errors="replace"))
+                        continue
+
+                    # SSE -> WS：逐条转发 data JSON
+                    cap = bytearray() if (allow_write and cache_key_ws) else None
+                    max_body_bytes = int(_gateway_cfg.get("max_body_bytes", 0) or 0)
+                    saw_completed = False
+                    saw_failed = False
+                    stream_ok = True
+                    for data in _iter_sse_data_strings(resp):
+                        # 先发给客户端（以“可用性”为主），缓存仅 best-effort
+                        try:
+                            _ws_send_text(self.wfile, data)
+                        except Exception:
+                            # 客户端断开/写失败：终止该 response；且不应写入缓存
+                            stream_ok = False
+                            break
+
+                        if cap is not None:
+                            try:
+                                b = (str(data or "") + "\n").encode("utf-8")
+                            except Exception:
+                                b = b""
+                            if not b:
+                                continue
+                            if max_body_bytes > 0 and (len(cap) + len(b) > max_body_bytes):
+                                # 超限：停止捕获（仍继续转发）
+                                cap = None
+                            else:
+                                cap.extend(b)
+
+                        # best-effort：判断是否 completed/failed（只缓存 completed）
+                        try:
+                            obj = json.loads(str(data or ""))
+                            if isinstance(obj, dict):
+                                t = str(obj.get("type") or "")
+                                if t == "response.completed" or t.endswith(".completed"):
+                                    saw_completed = True
+                                if t == "response.failed" or t.endswith(".failed"):
+                                    saw_failed = True
+                        except Exception:
+                            pass
+
+                    if (
+                        allow_write
+                        and cache_key_ws
+                        and stream_ok
+                        and cap is not None
+                        and saw_completed
+                        and (not saw_failed)
+                        and int(status) == 200
+                    ):
+                        try:
+                            _cache_put(cache_key_ws, status=200, headers=[("Content-Type", "application/json")], body=bytes(cap))
+                        except Exception:
+                            pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            try:
+                _ws_send_close(self.wfile, 1000, "")
+            except Exception:
+                pass
+
         def _handle(self):
             global _cache_bypass, _cache_stale_hits, _cache_sie_hits, _cache_served_tokens, _cache_swr_refreshes, _cache_swr_refresh_errors
             try:
@@ -1315,6 +2025,55 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
 
             path_only = urlsplit(self.path).path
             auth = self.headers.get("Authorization", "") or ""
+
+            # ---- WebSocket Upgrade 说明 ----
+            # 管理 UI 里“WebSocket 认证(/v1/ws)”仅控制 /v1/ws 的鉴权（部分上游实现使用），
+            # 与 /v1/responses 的 WebSocket mode 无关。
+            # 本项目支持 /v1/responses 的 WebSocket mode（Codex 的 responses_websockets_v2 会用到）。
+            # 若客户端误向 /v1/ws 发起 Upgrade，则在这里返回清晰错误信息避免误判。
+            try:
+                upgrade = str(self.headers.get("Upgrade", "") or "").strip().lower()
+                connection = str(self.headers.get("Connection", "") or "").strip().lower()
+                is_ws_upgrade = ("websocket" in upgrade) or (
+                    "upgrade" in connection and "websocket" in upgrade
+                )
+            except Exception:
+                is_ws_upgrade = False
+
+            if is_ws_upgrade and path_only == "/v1/ws":
+                self.send_response(400)
+                self.send_header("Access-Control-Allow-Headers", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                msg = json.dumps(
+                    {
+                        "error": (
+                            "当前实例不支持 /v1/ws 的 WebSocket Upgrade（该路径仅用于部分上游的 WS 通道）。"
+                            "如需让 Codex 使用 WebSocket，请对 /v1/responses 发起 Upgrade，并在 ~/.codex/config.toml 中启用："
+                            "model_providers.OpenAI.supports_websockets=true 且 features.responses_websockets_v2=true。"
+                            "（若更关注稳定/更低尾延迟，可保持 HTTP/SSE 配置为 false。）"
+                        )
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                try:
+                    self.wfile.write(msg)
+                except Exception:
+                    pass
+                return
+
+            if is_ws_upgrade and path_only == "/v1/responses":
+                self._handle_responses_websocket(auth_header=auth)
+                return
+
+            # ---- 请求体归一（与缓存逻辑无关：即使只启用 gateway_enabled 也要生效）----
+            # 背景：Codex CLI 会携带 tools 列表；部分网关/代理实现可能不支持某些 tool type（例如 image_generation）。
+            # 策略：仅做最小必要改写 —— 移除不被 CLIProxyAPI 接受的 tool 类型，避免 400 直接失败。
+            if self.command.upper() == "POST" and path_only == "/v1/responses" and body:
+                body = _sanitize_responses_body_bytes(body)
 
             # 仅对 /v1/responses / /v1/chat/completions（非 stream）启用缓存；其它请求直接透传
             cache_candidate = (
@@ -1346,7 +2105,8 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 except Exception:
                     pass
 
-                if stream_flag:
+                cache_stream_enabled = bool(_gateway_cfg.get("cache_stream_enabled", False))
+                if stream_flag and not cache_stream_enabled:
                     _cache_bypass += 1
                     self._proxy_upstream(body=body)
                     return
@@ -1368,7 +2128,14 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 cache_cc = str(self.headers.get("Cache-Control", "") or "").strip().lower()
                 bypass_read = False
                 no_store = False
-                if cache_ctl in ("bypass", "off", "no-store", "0") or ("no-store" in cache_cc):
+                # 约定（与浏览器 Cache-Control 语义保持一致，且对压测/排障更友好）：
+                # - bypass/off/0：绕过读取 + 不写入（强制走回源）
+                # - no-store：不写入，但允许读取已有缓存（如存在）
+                # - refresh/no-cache/revalidate：绕过读取，但允许写入新结果（刷新缓存）
+                if cache_ctl in ("bypass", "off", "0"):
+                    bypass_read = True
+                    no_store = True
+                elif cache_ctl == "no-store" or ("no-store" in cache_cc):
                     no_store = True
                 elif cache_ctl in ("refresh", "no-cache", "revalidate") or ("no-cache" in cache_cc):
                     bypass_read = True
@@ -1377,6 +2144,14 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                     data = entry.get("body") or b""
                     headers = entry.get("headers") or []
                     status = int(entry.get("status", 200) or 200)
+                    is_sse = False
+                    try:
+                        for hk, hv in headers:
+                            if str(hk or "").lower() == "content-type" and str(hv or "").lower().startswith("text/event-stream"):
+                                is_sse = True
+                                break
+                    except Exception:
+                        is_sse = False
                     self.send_response(status)
                     for hk, hv in headers:
                         lk = str(hk or "").lower()
@@ -1387,9 +2162,19 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                         self.send_header(hk, hv)
                     self.send_header("X-AIProxyHub-Cache", str(tag or "HIT"))
                     self.send_header("Content-Length", str(len(data)))
+                    if is_sse:
+                        # 重要：SSE 客户端（包括 Codex）通常以 EOF 作为“完成”信号。
+                        # 缓存回放时我们一次性写入完整 body，因此必须显式 close 连接避免客户端挂起等待后续事件。
+                        self.send_header("Connection", "close")
                     self.end_headers()
+                    if is_sse:
+                        self.close_connection = True
                     try:
                         self.wfile.write(data)
+                        try:
+                            self.wfile.flush()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
 
@@ -1586,7 +2371,12 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                     return
 
                 try:
-                    r = self._proxy_upstream(body=body, cache_tag=("MISS" if bypass_read else "MISS"))
+                    capture = bool(stream_flag) and bool(_gateway_cfg.get("cache_stream_enabled", False))
+                    r = self._proxy_upstream(
+                        body=body,
+                        cache_tag=("MISS" if bypass_read else "MISS"),
+                        capture_stream=capture,
+                    )
                     if isinstance(r, tuple) and len(r) == 3 and not no_store:
                         status, headers, data = r
                         # 仅缓存成功响应（避免把 401/429/5xx 缓存住）
@@ -1614,13 +2404,13 @@ def start_gateway(listen_host: str, listen_port: int, upstream_port: int):
         gateway_listen_port = int(listen_port or 0)
 
         handler = _make_gateway_handler("127.0.0.1", gateway_upstream_port)
-        gateway_server = http.server.ThreadingHTTPServer((gateway_listen_host, gateway_listen_port), handler)
         # 提升并发下的连接排队能力（backlog），避免短时间突发连接导致拒绝/超时。
-        # Python 标准库默认 request_queue_size=5 对于网关场景偏小。
-        try:
-            gateway_server.request_queue_size = 128
-        except Exception:
-            pass
+        # 注意：request_queue_size 必须在 listen() 之前生效；因此要用子类覆写类属性，
+        # 仅在实例化后再赋值通常不会影响已监听 socket 的 backlog。
+        class _GatewayServer(http.server.ThreadingHTTPServer):
+            request_queue_size = 128
+
+        gateway_server = _GatewayServer((gateway_listen_host, gateway_listen_port), handler)
 
         t = threading.Thread(target=gateway_server.serve_forever, daemon=True)
         gateway_thread = t
@@ -1684,6 +2474,19 @@ def _watch_process_cleanup(proc, kind: str, config_path: str):
     except Exception:
         return
 
+    # 记录退出（解决“黑框闪退但看不到原因”的问题：至少留下 exit code 线索）
+    try:
+        rc = int(getattr(proc, "returncode", 0) or 0)
+    except Exception:
+        rc = 0
+    try:
+        if kind == "proxy":
+            log(f"[SYS] 代理进程已退出 exit={rc}")
+        elif kind == "register":
+            log(f"[SYS] 注册进程已退出 exit={rc}")
+    except Exception:
+        pass
+
     _safe_unlink(config_path)
 
     # 清理全局引用（避免误判“仍在运行”）
@@ -1713,13 +2516,27 @@ def start_proxy():
 
     with _lock:
         if (proxy_process and proxy_process.poll() is None) or (gateway_server is not None):
-            return {"ok": False, "msg": "代理已在运行中"}
+            # 幂等：已在运行视为成功，避免 UI 误报红色错误
+            return {"ok": True, "msg": "代理已在运行中", "already_running": True, "managed": True}
         s = load_settings()
         ok, msg = preflight("start_proxy", s)
         if not ok:
             return {"ok": False, "msg": msg}
 
         external_port = int(s.get("proxy_port", 8317) or 8317)
+
+        # 关键修复：端口上若已存在可用的 CLIProxyAPI（可能由其它 AIProxyHub/旧版本启动），
+        # 本实例不再重复启动，避免出现“黑框闪一下就没了”（新进程绑定端口失败后瞬间退出）。
+        if _proxy_reachable(external_port):
+            return {
+                "ok": True,
+                "already_running": True,
+                "managed": False,
+                "msg": (
+                    f"检测到端口 {external_port} 已有代理服务在运行（为避免冲突，本次不再重复启动）。"
+                    "若你希望应用当前配置（含网关/缓存），请先关闭占用端口的其它 AIProxyHub/cli-proxy-api 进程，或修改端口后重试。"
+                ),
+            }
 
         # 若启用缓存/网关：对外端口给网关占用；CLIProxyAPI 改为内部端口监听
         gw_enabled = bool(s.get("gateway_enabled", False)) or bool(s.get("cache_enabled", False))
@@ -1741,15 +2558,25 @@ def start_proxy():
             generate_proxy_config(s, proxy_config_path)
 
         exe = _get_proxy_exe_path()
+        # Windows EXE（--noconsole）启动 console 子进程时，会弹出一个黑框。
+        # 这里默认隐藏 CLIProxyAPI 的控制台窗口，避免用户误以为“程序闪退/异常”。
+        creationflags = 0
+        if _is_windows() and _is_frozen_exe() and not str(os.getenv("AIPROXYHUB_SHOW_PROXY_CONSOLE", "") or "").strip():
+            try:
+                creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW"))
+            except Exception:
+                creationflags = 0
         proxy_process = subprocess.Popen(
             [exe, "-config", proxy_config_path],
             cwd=ROOT,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=creationflags,
         )
         threading.Thread(target=stream_output, args=(proxy_process, "PROXY"), daemon=True).start()
         threading.Thread(
@@ -1806,7 +2633,22 @@ def start_proxy():
     while time.time() < deadline:
         # 子进程异常退出（快速失败）
         if proxy_process is None or (proxy_process and proxy_process.poll() is not None):
-            return {"ok": False, "msg": "代理进程异常退出（请查看日志）"}
+            rc = None
+            try:
+                rc = int(getattr(proxy_process, "returncode", None)) if proxy_process else None
+            except Exception:
+                rc = None
+            last = ""
+            try:
+                tail = _tail_log_lines("[PROXY]", 1)
+                if tail:
+                    last = str(tail[-1])
+            except Exception:
+                last = ""
+            msg = f"代理进程异常退出（exit={rc if rc is not None else '?'}）。请查看「运行日志」中的 [PROXY] 输出。"
+            if last:
+                msg += f" 最后日志: {last}"
+            return {"ok": False, "msg": msg}
         if _proxy_reachable(external_port):
             break
         time.sleep(0.25)
@@ -1851,6 +2693,10 @@ def start_proxy():
 def stop_proxy():
     global proxy_process
     global proxy_config_path
+    # 如果端口上存在“外部启动的代理”，stop/restart 无法管理，只能提示用户手动处理。
+    s = load_settings()
+    port = int(s.get("proxy_port", 8317) or 8317)
+    external_running = _proxy_reachable(port)
     proc = None
     cfg = None
     gw_running = False
@@ -1868,7 +2714,17 @@ def stop_proxy():
             proxy_config_path = None
             if not gw_running:
                 _safe_unlink(cfg)
-                return {"ok": False, "msg": "代理未在运行"}
+                if external_running:
+                    return {
+                        "ok": False,
+                        "external_running": True,
+                        "msg": (
+                            f"检测到端口 {port} 上已有代理服务在运行，但不是本实例启动，无法停止。"
+                            "请关闭其它 AIProxyHub（或结束 cli-proxy-api.exe 进程），或修改端口后重试。"
+                        ),
+                    }
+                # 幂等：未运行视为成功
+                return {"ok": True, "msg": "代理未在运行"}
 
     # 优先停止网关，避免对外继续接受请求
     if gw_running:
@@ -1905,6 +2761,9 @@ def restart_proxy():
     """
     r1 = stop_proxy()
     if not bool(r1.get("ok", False)):
+        # 外部占用端口：本实例无法重启
+        if bool(r1.get("external_running", False)):
+            return r1
         # 未在运行：直接尝试启动
         r2 = start_proxy()
         if bool(r2.get("ok", False)):
@@ -2711,10 +3570,12 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
   <div class="card">
     <div class="card-title">缓存池（跨账号节省额度）</div>
     <div style="font-size:12px;color:var(--dim);line-height:1.9;margin-bottom:10px">
-      开启后：AIProxyHub 会在 <code>监听端口</code> 启动透明网关，CLIProxyAPI 改为内部端口监听；对 <code>/v1/responses</code> / <code>/v1/chat/completions</code>（非 stream）做去重缓存。缓存命中不会消耗账号额度。
+      开启后：AIProxyHub 会在 <code>监听端口</code> 启动透明网关，CLIProxyAPI 改为内部端口监听；对 <code>/v1/responses</code> / <code>/v1/chat/completions</code> 做去重缓存。缓存命中不会消耗账号额度。<br>
+      默认仅缓存非 stream；如启用 <code>stream 缓存</code>，则会把 SSE/WS 事件流写入内存并在命中时快速回放（更适合重复任务/压测）。
     </div>
 	    <div class="check-row"><input type="checkbox" id="s-gateway_enabled"><label for="s-gateway_enabled">启用透明网关（不改 Base URL）</label></div>
-	    <div class="check-row"><input type="checkbox" id="s-cache_enabled"><label for="s-cache_enabled">启用响应缓存（仅非 stream）</label></div>
+	    <div class="check-row"><input type="checkbox" id="s-cache_enabled"><label for="s-cache_enabled">启用响应缓存（非 stream）</label></div>
+	    <div class="check-row"><input type="checkbox" id="s-cache_stream_enabled"><label for="s-cache_stream_enabled">启用 stream 缓存（SSE/WS，命中时快速回放）</label></div>
 	    <div class="check-row"><input type="checkbox" id="s-cache_shared_across_api_keys"><label for="s-cache_shared_across_api_keys">跨 API Key 共享缓存（仅可信环境）</label></div>
 	    <div class="form-grid three" style="margin-top:12px">
 	      <div class="form-group"><label>缓存 TTL（秒）</label><input id="s-cache_ttl_seconds" type="number"></div>
@@ -2732,7 +3593,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
 	    </div>
     <div class="hint" style="margin-top:10px">
       注意：修改该配置后需要重启代理才会生效；如代理正在运行，可在仪表盘点击「重启代理」立即应用（会短暂中断连接）。<br>
-      请求级控制：<code>X-AIProxyHub-Cache: bypass</code> 禁用读写缓存；<code>X-AIProxyHub-Cache: refresh</code> 跳过读取并强制回源更新缓存。
+      请求级控制：<code>X-AIProxyHub-Cache: bypass</code> 绕过读写；<code>X-AIProxyHub-Cache: refresh</code> 绕过读取并回源更新；<code>X-AIProxyHub-Cache: no-store</code> 不写入（允许读）。
     </div>
   </div>
   <div class="btn-row">
@@ -2852,7 +3713,7 @@ const fields=[
   'cache_max_entries','cache_max_body_kb','cache_max_total_mb',
   'cache_stale_while_revalidate_seconds','cache_stale_if_error_seconds'
 ];
-const checks=['quota_switch_project','quota_switch_preview','debug','store_passwords','write_ak_rk','keep_token_json','keep_token_json_on_fail','gateway_enabled','cache_enabled','cache_shared_across_api_keys'];
+const checks=['quota_switch_project','quota_switch_preview','debug','store_passwords','write_ak_rk','keep_token_json','keep_token_json_on_fail','gateway_enabled','cache_enabled','cache_stream_enabled','cache_shared_across_api_keys'];
 const intFields=new Set([
   'total_accounts','max_workers','proxy_port','request_retry',
   'cache_ttl_seconds','cache_ttl_jitter_seconds',
@@ -2862,6 +3723,7 @@ const intFields=new Set([
 const secretFields=new Set(['duckmail_token','management_password','api_key']);
 let settingsCache=null;
 let usageTick=0;
+let lastStatus=null;
 
 /* Navigation */
 document.querySelectorAll('.nav a').forEach(a=>{
@@ -2929,13 +3791,21 @@ async function refreshUsageSummary(){
     if(u && u.ok){
       $('d-usage-req').textContent=String(u.total_requests??0);
       $('d-usage-tokens').textContent=String(u.total_tokens??0);
+      $('d-usage-req').title='';
+      $('d-usage-tokens').title='';
     }else{
       $('d-usage-req').textContent='--';
       $('d-usage-tokens').textContent='--';
+      const hint=(u && u.msg)?String(u.msg):'';
+      $('d-usage-req').title=hint;
+      $('d-usage-tokens').title=hint;
     }
   }catch(e){
     $('d-usage-req').textContent='--';
     $('d-usage-tokens').textContent='--';
+    const hint='无法读取使用统计: '+(e && e.message?e.message:String(e));
+    $('d-usage-req').title=hint;
+    $('d-usage-tokens').title=hint;
   }
 }
 
@@ -2943,9 +3813,12 @@ async function refreshUsageSummary(){
 async function refreshStatus(){
   try{
     const r=await(await fetch('/api/status')).json();
+    lastStatus=r;
     const on=v=>v?'运行中':'已停止';
     const cls=v=>v?'on':'off';
-    $('d-proxy').textContent=on(r.proxy);$('d-proxy').className='stat-value '+cls(r.proxy);
+    const proxyText=r.proxy?(r.proxy_external?'运行中（外部）':'运行中'):'已停止';
+    const proxyTitle=r.proxy_external?'检测到代理端口已有外部服务在运行（本实例无法停止/重启该代理）。':''; 
+    $('d-proxy').textContent=proxyText;$('d-proxy').className='stat-value '+cls(r.proxy);$('d-proxy').title=proxyTitle;
     $('d-reg').textContent=r.register?'进行中':'空闲';$('d-reg').className='stat-value '+(r.register?'on':'off');
     $('d-count').textContent=r.accounts;
     $('d-port').textContent=r.port;
@@ -2963,7 +3836,7 @@ async function refreshStatus(){
         $('d-cache-ratio').textContent='--';
       }
     }catch(e){}
-    $('r-proxy').textContent=on(r.proxy);$('r-proxy').className='stat-value '+cls(r.proxy);
+    $('r-proxy').textContent=proxyText;$('r-proxy').className='stat-value '+cls(r.proxy);$('r-proxy').title=proxyTitle;
     $('r-reg').textContent=r.register?'进行中':'空闲';$('r-reg').className='stat-value '+(r.register?'on':'off');
     if(r.proxy)showApiInfo();
     updateAutopilot(r.autopilot);
@@ -3037,10 +3910,12 @@ function showApiInfo(){
   $('api-info').style.display='block';
 }
 function openPanel(){
+  if(lastStatus && !lastStatus.proxy){toast('代理未运行：请先点击「启动代理」',false);return;}
   const port=$('s-proxy_port')?.value||8317;
   window.open('http://localhost:'+port+'/management.html','_blank');
 }
 function openUsage(){
+  if(lastStatus && !lastStatus.proxy){toast('代理未运行：请先点击「启动代理」',false);return;}
   const port=$('s-proxy_port')?.value||8317;
   window.open('http://localhost:'+port+'/management.html#/usage','_blank');
 }
@@ -3265,14 +4140,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             s = load_settings()
             gw_enabled = bool(s.get("gateway_enabled", False)) or bool(s.get("cache_enabled", False))
+            port = int(s.get("proxy_port", 8317) or 8317)
+            proxy_reachable = _proxy_reachable(port)
             proxy_alive = proxy_process is not None and proxy_process.poll() is None
             gw_alive = gateway_server is not None
-            proxy_ok = proxy_alive and (not gw_enabled or gw_alive)
+            proxy_managed = bool(proxy_alive or gw_alive)
+            proxy_external = bool(proxy_reachable and not proxy_managed)
+            # 以“端口可用性”为准：避免出现“代理其实已在运行，但因为不是本实例启动而显示已停止”的误判
+            proxy_ok = bool(proxy_reachable)
             self._json({
                 "proxy": proxy_ok,
+                "proxy_managed": proxy_managed,
+                "proxy_external": proxy_external,
                 "register": register_process is not None and register_process.poll() is None,
                 "accounts": len(get_accounts()),
-                "port": s.get("proxy_port", 8317),
+                "port": port,
+                "paths": {
+                    "root": str(ROOT),
+                    "settings_file": str(SETTINGS_FILE),
+                    "data_dir": str(DATA_DIR),
+                    "runtime_dir": str(RUNTIME_DIR),
+                },
                 "autopilot": autopilot_state,
                 "gateway": {
                     "enabled": gw_enabled,
@@ -3302,15 +4190,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if ep == "status":
                 s = load_settings()
                 gw_enabled = bool(s.get("gateway_enabled", False)) or bool(s.get("cache_enabled", False))
+                port = int(s.get("proxy_port", 8317) or 8317)
+                proxy_reachable = _proxy_reachable(port)
                 proxy_alive = proxy_process is not None and proxy_process.poll() is None
                 gw_alive = gateway_server is not None
-                proxy_ok = proxy_alive and (not gw_enabled or gw_alive)
+                proxy_managed = bool(proxy_alive or gw_alive)
+                proxy_external = bool(proxy_reachable and not proxy_managed)
+                proxy_ok = bool(proxy_reachable)
                 self._json({
                     "ok": True,
                     "proxy": proxy_ok,
+                    "proxy_managed": proxy_managed,
+                    "proxy_external": proxy_external,
                     "register": register_process is not None and register_process.poll() is None,
                     "accounts": len(get_accounts()),
-                    "port": s.get("proxy_port", 8317),
+                    "port": port,
+                    "paths": {
+                        "root": str(ROOT),
+                        "settings_file": str(SETTINGS_FILE),
+                        "data_dir": str(DATA_DIR),
+                        "runtime_dir": str(RUNTIME_DIR),
+                    },
                     "autopilot": autopilot_state,
                     "gateway": {
                         "enabled": gw_enabled,
@@ -3530,6 +4430,28 @@ def main(argv=None):
     if host not in ("127.0.0.1", "localhost") and not args.allow_remote:
         raise SystemExit("安全拦截：launcher 默认仅允许绑定 127.0.0.1；如需非本机监听，请加 --allow-remote")
 
+    # Windows 安装版/EXE：默认启用单实例，避免用户误开多个面板导致“启动代理黑框闪现/CPA 面板异常”等问题。
+    # 说明：按 ROOT（AIPROXYHUB_HOME）分区；不同隔离目录仍可并存（用于冒烟/测试）。
+    if _is_frozen_exe():
+        if not _acquire_single_instance_mutex():
+            # 尽量找到已运行实例的真实端口（端口可能被占用后自动递增）
+            base_port = int(args.port or LAUNCHER_PORT)
+            preferred = [_read_launcher_port_file(), base_port, int(LAUNCHER_PORT)]
+            try:
+                preferred += list(range(int(LAUNCHER_PORT), int(LAUNCHER_PORT) + 12))
+            except Exception:
+                pass
+            existing_port = _discover_existing_launcher_port(preferred) or base_port
+            url = f"http://localhost:{existing_port}"
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            _windows_message_box(
+                f"AIProxyHub 已在运行。\n\n已尝试为你打开：\n{url}\n\n如仍异常，请先关闭重复的 AIProxyHub 进程后再试。"
+            )
+            raise SystemExit(0)
+
     s = load_settings()  # 启动即触发 DPAPI 自动迁移
 
     for lf_name, lf_path in [("config.yaml", PROXY_CONFIG), ("register/config.json", REGISTER_CONFIG)]:
@@ -3555,17 +4477,18 @@ def main(argv=None):
     if not args.strict_port:
         port = find_free_port(port, host=host)
 
-    server = http.server.ThreadingHTTPServer((host, port), Handler)
     # 提升并发下的连接排队能力（backlog）。对本地面板/External API 也更稳健。
-    try:
-        server.request_queue_size = 128
-    except Exception:
-        pass
+    # 同上：request_queue_size 需要在 listen() 之前生效，因此用子类覆写类属性。
+    class _LauncherServer(http.server.ThreadingHTTPServer):
+        request_queue_size = 128
+
+    server = _LauncherServer((host, port), Handler)
 
     # 绑定到 0.0.0.0 时，本机仍可用 localhost 访问；远端请使用机器 IP。
     display_host = "localhost" if host in ("127.0.0.1", "0.0.0.0") else host
     url = f"http://{display_host}:{port}"
     print(f"\n  AIProxyHub 管理面板 → {url}\n")
+    _write_launcher_port_file(port)
     if not args.no_browser:
         webbrowser.open(url)
     try:
