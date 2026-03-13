@@ -23,7 +23,8 @@ if (-not $release) { throw "无法读取 GitHub latest release：$api" }
 
 $asset = $null
 foreach ($a in ($release.assets | Where-Object { $_ })) {
-  if ($a.name -match "_windows_amd64\\.zip$") { $asset = $a; break }
+  # PowerShell 字符串里反斜杠不需要双写；这里直接用 -like 匹配更稳（避免正则转义坑）
+  if ($a.name -like "*_windows_amd64.zip") { $asset = $a; break }
 }
 if (-not $asset) {
   throw "未找到 windows_amd64.zip 资产。请打开 release 手动确认：$($release.html_url)"
@@ -66,4 +67,3 @@ try {
 } finally {
   try { Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue } catch {}
 }
-
