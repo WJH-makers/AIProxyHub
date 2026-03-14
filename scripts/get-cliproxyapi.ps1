@@ -1,6 +1,10 @@
 param(
   # 默认下载 router-for-me/CLIProxyAPI 的 latest release（Windows amd64）。
-  [switch]$Force
+  [switch]$Force,
+  # 网络抖动下的重试次数（curl --retry）。
+  [int]$Retries = 5,
+  # 重试间隔（秒）。
+  [int]$RetryDelaySeconds = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,8 +46,26 @@ $extractDir = Join-Path $tmpDir "extract"
 try {
   Write-Host "[CLIProxyAPI] 下载：$name"
   Write-Host "  $url"
-  curl.exe -L $url -o $zipPath | Out-Null
+  # GitHub 资产下载在部分网络环境下偶发 RST/超时，这里做 best-effort 重试。
+  # - --retry-all-errors: 覆盖更多网络层失败（curl 7.71+）
+  # - --fail: 4xx/5xx 直接失败，避免下载到 HTML 错误页
+  # - 仍保留脚本原有“文件存在性”校验作为最终护栏
+  $curlArgs = @(
+    "-L",
+    "--fail",
+    "--retry", [string]([Math]::Max(0, $Retries)),
+    "--retry-delay", [string]([Math]::Max(0, $RetryDelaySeconds))
+  )
+  try { $curlArgs += @("--retry-all-errors") } catch {}
+  $curlArgs += @($url, "-o", $zipPath)
+  curl.exe @curlArgs | Out-Null
   if (-not (Test-Path $zipPath)) { throw "下载失败：$zipPath" }
+  try {
+    $sz = (Get-Item $zipPath).Length
+    if ($sz -le 0) { throw "下载到的 zip 文件为空：$zipPath" }
+  } catch {
+    throw
+  }
 
   Write-Host "[CLIProxyAPI] 解压..."
   Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force

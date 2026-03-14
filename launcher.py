@@ -97,7 +97,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -1581,6 +1581,7 @@ def _sanitize_responses_body_bytes(body: bytes) -> bytes:
     对 /v1/responses 请求体做最小必要归一：
     - 移除 CLIProxyAPI 暂不支持的 tool 类型（例如 image_generation）
     - 若 tool_choice 指向被移除的工具则清掉，避免二次校验失败
+    - 兼容“模型名携带推理档位”的别名（例如 gpt5.2-codex-high / gpt5.2-xhigh）
     """
     if not body:
         return body
@@ -1589,6 +1590,57 @@ def _sanitize_responses_body_bytes(body: bytes) -> bytes:
         if not isinstance(obj, dict):
             return body
         changed = False
+
+        # ---- model alias / reasoning.effort 归一（尽量放在最前，便于后续缓存 key 稳定）----
+        try:
+            model = obj.get("model")
+            if isinstance(model, str):
+                m0 = model
+                m = model.strip()
+                # 兼容缺少分隔符的写法：gpt5.2 -> gpt-5.2
+                # （部分路由器会在 provider 判定前就尝试解析 model；这里提前归一，避免 502 unknown provider）
+                m = re.sub(r"^gpt5(?=\.)", "gpt-5", m)
+
+                fixed_effort: str | None = None
+                target_model: str | None = None
+
+                # 仅对“别名语义明确”的后缀做强制归一
+                # - *-codex-high -> *-codex + reasoning.effort=high
+                # - *-xhigh      -> *        + reasoning.effort=xhigh
+                if (m.startswith("gpt-5.") or m.startswith("gpt5.")) and m.endswith("-codex-high"):
+                    target_model = m[: -len("-high")]
+                    fixed_effort = "high"
+                elif (m.startswith("gpt-5.") or m.startswith("gpt5.")) and m.endswith("-xhigh"):
+                    target_model = m[: -len("-xhigh")]
+                    fixed_effort = "xhigh"
+
+                # 若只是缺少分隔符（gpt5.2 -> gpt-5.2）且不属于“档位别名”，也尽量归一，避免 provider 判定失败。
+                if (not target_model) and m and m != m0:
+                    obj["model"] = m
+                    changed = True
+
+                if target_model:
+                    # 再次归一：若上面分支里仍残留 gpt5. 前缀，转成 gpt-5.
+                    target_model = re.sub(r"^gpt5(?=\.)", "gpt-5", str(target_model))
+                    if target_model and target_model != m0:
+                        obj["model"] = target_model
+                        changed = True
+
+                if fixed_effort:
+                    # Responses API 形态：reasoning: { effort: "high|xhigh|..." }
+                    r = obj.get("reasoning")
+                    if isinstance(r, dict):
+                        if str(r.get("effort") or "") != fixed_effort:
+                            r["effort"] = fixed_effort
+                            obj["reasoning"] = r
+                            changed = True
+                    else:
+                        obj["reasoning"] = {"effort": fixed_effort}
+                        changed = True
+        except Exception:
+            # 归一失败不应阻断请求
+            pass
+
         tools = obj.get("tools")
         if isinstance(tools, list):
             new_tools = []
@@ -1769,6 +1821,118 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                 self.end_headers()
                 self.wfile.write(data)
                 return status, headers, data
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        def _proxy_models_with_aliases(self):
+            """
+            /v1/models 代理（buffered）：
+            - 透传上游模型列表
+            - 在“上游存在基础模型”时，注入 AIProxyHub 约定的别名模型（便于 Codex/其它客户端直接选择）
+
+            说明：
+            - 仅对返回 JSON 的 200 响应做 best-effort 注入；失败则原样透传。
+            - 只注入“语义稳定”的别名（以及带 gpt- 分隔符的同义别名）：
+              - gpt5.X-codex-high（指向 gpt-5.X-codex + reasoning.effort=high）
+              - gpt5.X-xhigh（指向 gpt-5.X + reasoning.effort=xhigh）
+            """
+            # 复制请求头（剔除 hop-by-hop；并重写 Host）
+            req_headers = {}
+            for k, v in (self.headers.items() or []):
+                lk = str(k or "").lower()
+                if lk in _HOP_BY_HOP_HEADERS:
+                    continue
+                if lk == "host":
+                    continue
+                if lk == "accept-encoding":
+                    continue
+                if lk in ("content-length", "transfer-encoding"):
+                    continue
+                if lk.startswith("x-aiproxyhub-"):
+                    continue
+                req_headers[k] = v
+            req_headers["Host"] = f"{upstream_host}:{upstream_port}"
+
+            conn = http.client.HTTPConnection(upstream_host, upstream_port, timeout=30)
+            try:
+                try:
+                    conn.request("GET", self.path, headers=req_headers)
+                    resp = conn.getresponse()
+                except Exception as e:
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    msg = json.dumps({"error": f"上游不可用：{e}"}, ensure_ascii=False).encode("utf-8")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(msg)
+                    except Exception:
+                        pass
+                    return
+
+                status = int(getattr(resp, "status", 502) or 502)
+                headers = list(resp.getheaders() or [])
+                data = resp.read() or b""
+
+                out = data
+                if int(status) == 200 and data:
+                    try:
+                        obj = json.loads(data.decode("utf-8", errors="replace"))
+                        if isinstance(obj, dict) and isinstance(obj.get("data"), list):
+                            data_list = obj.get("data") or []
+                            existing_ids: set[str] = set()
+                            for it in data_list:
+                                if isinstance(it, dict) and it.get("id"):
+                                    existing_ids.add(str(it["id"]))
+
+                            def _add(mid: str):
+                                if not mid or mid in existing_ids:
+                                    return
+                                data_list.append({"id": mid, "object": "model"})
+                                existing_ids.add(mid)
+
+                            # 仅当基础模型存在时才注入别名，避免客户端选择后直接 404/502
+                            # 约定：仅对 gpt-5.* 做注入（其它模型不推断其推理档位语义）
+                            for base_id in sorted(existing_ids):
+                                sid = str(base_id)
+
+                                # gpt-5.X-codex -> gpt5.X-codex-high / gpt-5.X-codex-high
+                                m = re.match(r"^gpt-5\.(\d+)-codex$", sid)
+                                if m:
+                                    minor = str(m.group(1))
+                                    _add(f"gpt5.{minor}-codex-high")
+                                    _add(f"gpt-5.{minor}-codex-high")
+                                    continue
+
+                                # gpt-5.X -> gpt5.X-xhigh / gpt-5.X-xhigh
+                                m = re.match(r"^gpt-5\.(\d+)$", sid)
+                                if m:
+                                    minor = str(m.group(1))
+                                    _add(f"gpt5.{minor}-xhigh")
+                                    _add(f"gpt-5.{minor}-xhigh")
+
+                            obj["data"] = data_list
+                            out = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                    except Exception:
+                        out = data
+
+                self.send_response(status)
+                for hk, hv in headers:
+                    lk = str(hk or "").lower()
+                    if lk in _HOP_BY_HOP_HEADERS:
+                        continue
+                    if lk in ("content-length", "transfer-encoding"):
+                        continue
+                    self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(out or b"")))
+                self.end_headers()
+                try:
+                    self.wfile.write(out or b"")
+                except Exception:
+                    pass
             finally:
                 try:
                     conn.close()
@@ -2150,6 +2314,11 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
 
             if is_ws_upgrade and path_only == "/v1/responses":
                 self._handle_responses_websocket(auth_header=auth)
+                return
+
+            # /v1/models：注入别名模型（best-effort，失败则退回原样透传）
+            if (not is_ws_upgrade) and self.command.upper() == "GET" and path_only == "/v1/models":
+                self._proxy_models_with_aliases()
                 return
 
             # ---- 请求体归一（与缓存逻辑无关：即使只启用 gateway_enabled 也要生效）----
