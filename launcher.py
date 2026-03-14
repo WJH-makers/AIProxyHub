@@ -128,7 +128,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.12"
+APP_VERSION = "1.2.13"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
