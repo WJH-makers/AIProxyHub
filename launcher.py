@@ -97,7 +97,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -2661,6 +2661,19 @@ def start_gateway(listen_host: str, listen_port: int, upstream_port: int):
         # 仅在实例化后再赋值通常不会影响已监听 socket 的 backlog。
         class _GatewayServer(http.server.ThreadingHTTPServer):
             request_queue_size = 128
+            # Windows 下 http.server.HTTPServer 默认会打开 SO_REUSEADDR，这会允许“多进程同时绑定同一端口”，
+            # 造成流量被系统分流到不同实例（表现为偶发 401 / stream 断连 / 缓存命中异常等）。
+            #
+            # 这里显式关闭 reuse_address，并尽量启用 SO_EXCLUSIVEADDRUSE 防止端口共享。
+            allow_reuse_address = False
+
+            def server_bind(self):
+                try:
+                    if _is_windows() and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                except Exception:
+                    pass
+                return super().server_bind()
 
         gateway_server = _GatewayServer((gateway_listen_host, gateway_listen_port), handler)
 
@@ -4938,6 +4951,16 @@ def main(argv=None):
     # 同上：request_queue_size 需要在 listen() 之前生效，因此用子类覆写类属性。
     class _LauncherServer(http.server.ThreadingHTTPServer):
         request_queue_size = 128
+        # 同 _GatewayServer：避免 Windows 下 SO_REUSEADDR 造成“多实例共享同一端口”。
+        allow_reuse_address = False
+
+        def server_bind(self):
+            try:
+                if _is_windows() and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except Exception:
+                pass
+            return super().server_bind()
 
     server = _LauncherServer((host, port), Handler)
     # 若用户启用了自动监控，则随 launcher 启动（不依赖面板操作/External API）。
