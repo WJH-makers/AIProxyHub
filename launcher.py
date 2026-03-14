@@ -106,7 +106,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.11"
+APP_VERSION = "1.2.12"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -2048,13 +2048,20 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                     # 当前仅实现 Codex 需要的 response.create（其余事件忽略即可）
                     continue
 
+                # 兼容两种 WS message 形态：
+                # 1) 旧形态（本项目早期实现/自测脚本）：{"type":"response.create","response":{...}}
+                # 2) Codex(v0.114.0+) 实际形态：{"type":"response.create", ...其余字段与 HTTP /v1/responses body 基本一致...}
                 resp_obj = msg.get("response")
-                if not isinstance(resp_obj, dict):
-                    _send_error(400, "missing response object")
-                    continue
+                if isinstance(resp_obj, dict):
+                    req_obj = dict(resp_obj)
+                else:
+                    # 去掉 type 字段后，剩余部分就是 /v1/responses 的请求体
+                    req_obj = {k: v for k, v in msg.items() if k != "type"}
+                    if not req_obj:
+                        _send_error(400, "missing response object")
+                        continue
 
                 # WebSocket mode 本身不需要 stream/background 字段；但上游 SSE 需要 stream=true
-                req_obj = dict(resp_obj)
                 req_obj.pop("background", None)
                 req_obj["stream"] = True
 

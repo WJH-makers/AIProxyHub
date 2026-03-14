@@ -217,6 +217,13 @@ class TestWSResponsesGatewayCache(unittest.TestCase):
                     "type": "response.create",
                     "response": {"model": "gpt5.2-xhigh", "input": "ping", "store": False},
                 }
+                # Codex(v0.114.0+) 真实形态（扁平）：type + 其余字段直接等同 /v1/responses body
+                msg_flat = {
+                    "type": "response.create",
+                    "model": "gpt5.2-xhigh",
+                    "input": "ping",
+                    "store": False,
+                }
                 # 第一次：冷缓存（必须回源 1 次）
                 types1 = _ws_request_once(host="127.0.0.1", port=gw_port, token="sk-test", msg=msg, timeout_s=10.0)
                 self.assertIn("response.completed", types1)
@@ -227,6 +234,13 @@ class TestWSResponsesGatewayCache(unittest.TestCase):
                 self.assertIn("response.completed", types2)
                 self.assertEqual(counter["n"], 1)
 
+                # 第三次：同请求但用“扁平消息形态”发起 → 仍应命中同一缓存键（不应再次回源）
+                types3 = _ws_request_once(
+                    host="127.0.0.1", port=gw_port, token="sk-test", msg=msg_flat, timeout_s=10.0
+                )
+                self.assertIn("response.completed", types3)
+                self.assertEqual(counter["n"], 1)
+
                 # 并发：两条连接同时发同一个请求 → singleflight 下仍应只回源 1 次
                 launcher._cache_clear()
                 counter["n"] = 0
@@ -235,7 +249,10 @@ class TestWSResponsesGatewayCache(unittest.TestCase):
                 lock = threading.Lock()
 
                 def worker():
-                    tps = _ws_request_once(host="127.0.0.1", port=gw_port, token="sk-test", msg=msg, timeout_s=10.0)
+                    # 并发场景也用 Codex 形态覆盖一次
+                    tps = _ws_request_once(
+                        host="127.0.0.1", port=gw_port, token="sk-test", msg=msg_flat, timeout_s=10.0
+                    )
                     with lock:
                         out.append(tps)
 

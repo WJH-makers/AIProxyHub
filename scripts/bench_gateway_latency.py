@@ -343,12 +343,11 @@ def run_ws(*, base_url: str, api_key: str, model: str, prompt: str, timeout_s: i
             # 直接从 sock 读取（对本地网关足够稳定）
             return _ws_recv_frame(sock)
 
+        # Codex(v0.114.0+) 真实形态：type + 其余字段直接等同 /v1/responses body
         msg = {
             "type": "response.create",
-            "response": {
-                "model": model,
-                "input": prompt,
-            },
+            "model": model,
+            "input": prompt,
         }
         frame = _ws_build_client_frame_text(json.dumps(msg, ensure_ascii=False))
         sock.sendall(frame)
@@ -475,4 +474,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

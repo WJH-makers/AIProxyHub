@@ -150,13 +150,17 @@ def main() -> int:
             pass
 
         # WebSocket mode: 客户端发送 response.create 事件
+        #
+        # 说明：
+        # - Codex(v0.114.0+) 实际发送的是“扁平形态”：
+        #     {"type":"response.create", ...其余字段直接等同 /v1/responses body...}
+        # - 早期自测脚本常用的 {"type":"response.create","response":{...}} 形态也被网关兼容，
+        #   但这里默认用 Codex 真实形态，避免压测/验收与实际不一致。
         msg = {
             "type": "response.create",
-            "response": {
-                "model": "gpt5.2-xhigh",
-                "input": "ping",
-                "store": False,
-            },
+            "model": "gpt5.2-xhigh",
+            "input": "ping",
+            "store": False,
         }
         _send_frame_masked(sock, 0x1, json.dumps(msg, ensure_ascii=False).encode("utf-8"))
 
