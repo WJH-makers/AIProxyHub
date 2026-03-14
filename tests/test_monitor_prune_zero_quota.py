@@ -38,6 +38,47 @@ class TestMonitorPruneZeroQuota(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(launcher.AUTH_DIR, "b.json")))
             self.assertTrue(os.path.exists(os.path.join(launcher.AUTH_DIR, "c.json")))
 
+    def test_prune_deletes_token_invalidated_when_enabled(self):
+        with isolated_launcher_fs() as (launcher, _td):
+            fn = "inv.json"
+            fp = os.path.join(launcher.AUTH_DIR, fn)
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump({"ok": True}, f)
+
+            q = {"ok": True, "accounts": [{"available": False, "file": fn, "error_code": "token_invalidated"}]}
+            cfg = {
+                "prune_zero_quota_enabled": True,
+                "prune_only_usage_limit_reached": True,
+                "prune_invalid_token_enabled": True,
+                "min_keep_accounts": 0,
+                "dry_run": False,
+            }
+            r = launcher._monitor_prune_zero_quota(q, cfg)
+            self.assertTrue(r.get("ok"), r)
+            self.assertEqual(r.get("candidates"), 1, r)
+            self.assertEqual(r.get("deleted"), 1, r)
+            self.assertFalse(os.path.exists(fp))
+
+    def test_prune_does_not_delete_token_invalidated_when_disabled(self):
+        with isolated_launcher_fs() as (launcher, _td):
+            fn = "inv2.json"
+            fp = os.path.join(launcher.AUTH_DIR, fn)
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump({"ok": True}, f)
+
+            q = {"ok": True, "accounts": [{"available": False, "file": fn, "error_type": "token_invalidated"}]}
+            cfg = {
+                "prune_zero_quota_enabled": True,
+                "prune_only_usage_limit_reached": True,
+                "prune_invalid_token_enabled": False,
+                "min_keep_accounts": 0,
+                "dry_run": False,
+            }
+            r = launcher._monitor_prune_zero_quota(q, cfg)
+            self.assertTrue(r.get("ok"), r)
+            self.assertEqual(r.get("deleted"), 0, r)
+            self.assertTrue(os.path.exists(fp))
+
     def test_prune_dry_run_does_not_delete(self):
         with isolated_launcher_fs() as (launcher, _td):
             fn = "dry.json"

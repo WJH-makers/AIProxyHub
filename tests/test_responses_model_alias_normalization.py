@@ -64,3 +64,28 @@ class TestResponsesModelAliasNormalization(unittest.TestCase):
             self.assertEqual(out.get("model"), "gpt-5.2-codex")
             self.assertEqual((out.get("reasoning") or {}).get("effort"), "high")
 
+    def test_codex_low_verbosity_is_normalized_to_medium(self):
+        with isolated_launcher_fs() as (launcher, _td):
+            out = self._sanitize(
+                launcher,
+                {
+                    "model": "gpt-5.2-codex",
+                    "input": "hi",
+                    "stream": False,
+                    "text": {"verbosity": "low"},
+                },
+            )
+            self.assertEqual((out.get("text") or {}).get("verbosity"), "medium")
+
+    def test_non_codex_low_verbosity_is_not_changed(self):
+        with isolated_launcher_fs() as (launcher, _td):
+            out = self._sanitize(
+                launcher,
+                {
+                    "model": "gpt-5.2",
+                    "input": "hi",
+                    "stream": False,
+                    "text": {"verbosity": "low"},
+                },
+            )
+            self.assertEqual((out.get("text") or {}).get("verbosity"), "low")

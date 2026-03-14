@@ -106,7 +106,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.10"
+APP_VERSION = "1.2.11"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -856,8 +856,9 @@ oauth-model-alias:
     - name: "gpt-5.2"
       alias: "gpt-5.2-xhigh"
       fork: true
-    - name: "gpt-5.1-codex-mini"
-      alias: "gpt-5.2-codex"
+    # 注意：不要把 gpt-5.2-codex 静默 alias 到 mini。
+    # - 这会导致“模型名与实际模型不一致”，并引发 client 侧参数兼容问题（例如 text.verbosity）。
+    # - 如需更快/更省的模型，请显式选择 gpt-5-codex-mini。
 
 oauth-excluded-models:
   codex:
@@ -1650,6 +1651,24 @@ def _sanitize_responses_body_bytes(body: bytes) -> bytes:
                         changed = True
         except Exception:
             # 归一失败不应阻断请求
+            pass
+
+        # ---- text.verbosity 兼容 ----
+        # 现状：Codex 系模型（*-codex*）在部分上游仅支持 text.verbosity=medium。
+        # Codex CLI 默认可能发送 low；若不处理，会产生 400 unsupported_value。
+        # 策略：仅在“模型名包含 codex”时，把 low 归一为 medium（不影响 gpt-5.2 这类支持 low 的模型）。
+        try:
+            model_now = obj.get("model")
+            text_obj = obj.get("text")
+            if isinstance(model_now, str) and isinstance(text_obj, dict):
+                v = text_obj.get("verbosity")
+                if isinstance(v, str) and v.strip().lower() == "low":
+                    if "codex" in model_now.lower():
+                        text_obj["verbosity"] = "medium"
+                        obj["text"] = text_obj
+                        changed = True
+        except Exception:
+            # 兼容失败不应阻断请求
             pass
 
         tools = obj.get("tools")
@@ -3568,6 +3587,8 @@ def _monitor_get_cfg() -> dict:
         "auto_register_enabled": bool(s.get("monitor_auto_register_enabled", True)),
         "prune_zero_quota_enabled": bool(s.get("monitor_prune_zero_quota_enabled", True)),
         "prune_only_usage_limit_reached": bool(s.get("monitor_prune_only_usage_limit_reached", True)),
+        # 鉴权失效（token_invalidated / invalid_api_key）通常不可恢复：默认启用自动剔除，降低 401 噪声与重试浪费
+        "prune_invalid_token_enabled": bool(s.get("monitor_prune_invalid_token_enabled", True)),
         "min_keep_accounts": min_keep,
         "dry_run": bool(s.get("monitor_dry_run", False)),
     }
@@ -3587,6 +3608,20 @@ def _is_usage_limit_reached_account(acc: dict) -> bool:
     return ("usage_limit" in hay) or ("insufficient_quota" in hay) or ("quota_exceeded" in hay)
 
 
+def _is_token_invalidated_account(acc: dict) -> bool:
+    """
+    判定该账号是否属于“鉴权已失效”的不可用类型（应自动剔除）。
+
+    CPA 返回字段可能随版本变化：这里做宽松匹配，仅在明确命中时返回 True。
+    """
+    t = str(acc.get("error_type", "") or "").lower()
+    c = str(acc.get("error_code", "") or "").lower()
+    st = str(acc.get("status", "") or "").lower()
+    sm = str(acc.get("status_message", "") or "").lower()
+    hay = " ".join([t, c, st, sm])
+    return ("token_invalidated" in hay) or ("invalid_api_key" in hay) or ("invalid api key" in hay)
+
+
 def _monitor_prune_zero_quota(q: dict, cfg: dict) -> dict:
     """
     基于 _query_quota() 的结果，删除“额度为零”的账号文件。
@@ -3601,8 +3636,11 @@ def _monitor_prune_zero_quota(q: dict, cfg: dict) -> dict:
     for acc in q.get("accounts", []) or []:
         if acc.get("available", True):
             continue
-        if cfg.get("prune_only_usage_limit_reached", True) and not _is_usage_limit_reached_account(acc):
-            continue
+        if cfg.get("prune_only_usage_limit_reached", True):
+            is_usage = _is_usage_limit_reached_account(acc)
+            is_invalid = bool(cfg.get("prune_invalid_token_enabled", True)) and _is_token_invalidated_account(acc)
+            if not (is_usage or is_invalid):
+                continue
         fn = str(acc.get("file", "") or "").strip()
         if not fn:
             # 兜底：历史兼容（email.json）
@@ -3672,12 +3710,12 @@ def _monitor_loop():
             pct = q["pct"]
             log(f"[MONITOR] 配额检查: {active}/{total} 可用 ({pct}%)")
 
-            # 删除已耗尽额度的账号（默认：仅 usage_limit_reached）
+            # 删除不可用账号（默认：仅 usage_limit_reached；可选：token_invalidated / invalid_api_key）
             prune = _monitor_prune_zero_quota(q, cfg)
             if prune.get("ok") and prune.get("candidates", 0) and not cfg.get("dry_run"):
-                log(f"[MONITOR] 已删除 {prune.get('deleted', 0)} 个额度为零的账号（候选 {prune.get('candidates', 0)}）")
+                log(f"[MONITOR] 已删除 {prune.get('deleted', 0)} 个不可用账号（候选 {prune.get('candidates', 0)}）")
             elif prune.get("ok") and prune.get("candidates", 0) and cfg.get("dry_run"):
-                log(f"[MONITOR] dry-run：发现 {prune.get('candidates', 0)} 个额度为零候选账号（未删除）")
+                log(f"[MONITOR] dry-run：发现 {prune.get('candidates', 0)} 个不可用候选账号（未删除）")
 
             # 低于阈值 且当前没有注册任务 → 自动注册（可开关）
             threshold = int(cfg.get("low_available_threshold_pct", 20) or 20)
@@ -3977,6 +4015,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     <div class="check-row"><input type="checkbox" id="s-monitor_enabled"><label for="s-monitor_enabled">启用后台监控（保存后自动生效）</label></div>
     <div class="check-row"><input type="checkbox" id="s-monitor_prune_zero_quota_enabled"><label for="s-monitor_prune_zero_quota_enabled">额度为零自动删除</label></div>
     <div class="check-row"><input type="checkbox" id="s-monitor_prune_only_usage_limit_reached"><label for="s-monitor_prune_only_usage_limit_reached">仅删除 <code>usage_limit_reached</code> 类型（更安全）</label></div>
+    <div class="check-row"><input type="checkbox" id="s-monitor_prune_invalid_token_enabled"><label for="s-monitor_prune_invalid_token_enabled">同时清理 <code>token_invalidated</code>/<code>invalid_api_key</code>（减少 401 噪声）</label></div>
     <div class="check-row"><input type="checkbox" id="s-monitor_auto_register_enabled"><label for="s-monitor_auto_register_enabled">可用率过低自动注册新账号</label></div>
     <div class="check-row"><input type="checkbox" id="s-monitor_dry_run"><label for="s-monitor_dry_run">Dry-run（只统计/不删除）</label></div>
     <div class="form-grid three" style="margin-top:12px">
@@ -4153,7 +4192,7 @@ const fields=[
 const checks=[
   'quota_switch_project','quota_switch_preview','debug',
   // monitor
-  'monitor_enabled','monitor_prune_zero_quota_enabled','monitor_prune_only_usage_limit_reached','monitor_auto_register_enabled','monitor_dry_run',
+  'monitor_enabled','monitor_prune_zero_quota_enabled','monitor_prune_only_usage_limit_reached','monitor_prune_invalid_token_enabled','monitor_auto_register_enabled','monitor_dry_run',
   // outputs
   'store_passwords','write_ak_rk','keep_token_json','keep_token_json_on_fail',
   // gateway/cache
