@@ -82,7 +82,16 @@ def _get_app_root() -> str:
         portable_flag = os.path.join(exe_dir, "AIProxyHub.portable")
         if os.path.exists(portable_flag) and _dir_is_writable(exe_dir):
             return exe_dir
-        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
+        # Windows 上 LOCALAPPDATA 在某些非交互/受限环境里可能缺失（例如任务计划/某些 shell）。
+        # 若直接回退到 APPDATA（Roaming），会导致 settings 路径漂移，引发“面板 key/配置不一致”。
+        base = os.getenv("LOCALAPPDATA")
+        if not base:
+            # 兜底：显式拼出用户 LocalAppData（更符合“安装版”软件语义）
+            home_local = os.path.join(os.path.expanduser("~"), "AppData", "Local")
+            if os.path.isdir(home_local):
+                base = home_local
+        if not base:
+            base = os.getenv("APPDATA") or os.path.expanduser("~")
         return os.path.join(base, "AIProxyHub")
 
     return SOURCE_DIR
@@ -97,7 +106,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.2.10"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -342,6 +351,8 @@ _REDACT_PATTERNS = [
     (re.compile(r"\bdk_[A-Za-z0-9]{8,}\b"), "dk_***"),
     # OpenAI-style key (用户也可能用别的前缀，但先覆盖最常见的)
     (re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b"), "sk-***"),
+    # AIProxyHub client key（本机网关用；避免 UI/控制台日志泄露）
+    (re.compile(r"\baiph_[A-Za-z0-9_-]{6,}\b"), "aiph_***"),
     # JWT（常见 token 形态，防止异常栈/日志中泄露）
     (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "jwt_***"),
     # 明确字段（注册脚本/日志中常见）

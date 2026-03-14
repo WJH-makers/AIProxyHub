@@ -39,6 +39,11 @@ if (-not ([string]$env:AIPH_API_KEY).Trim()) {
   # 通过 launcher.load_settings() 读取并解密（DPAPI）本地保存的 api_key（/v1/* 代理客户端密钥）
   # 重要：此处不会回显任何 key 明文；仅写入当前 PowerShell 进程环境变量。
   $token = & $py -c @"
+import sys
+root = r'''$root'''
+# 确保从脚本所在 repo 根目录导入 launcher.py（允许从任意 cwd 运行本脚本）
+if root and root not in sys.path:
+    sys.path.insert(0, root)
 import launcher
 launcher.SETTINGS_FILE = r'''$settingsFile'''
 s = launcher.load_settings()
