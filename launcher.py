@@ -77,6 +77,28 @@ def _get_app_root() -> str:
     if env_home:
         return os.path.abspath(os.path.expanduser(env_home))
 
+    # 重要：为避免“源码运行(ROOT=项目目录)”与“安装版运行(ROOT=LocalAppData)”并存时出现配置漂移，
+    # 这里在源码运行场景下做一个向后兼容的优先级调整：
+    # - 若用户曾运行过安装版（或显式把数据放进 LocalAppData），且 LocalAppData\\AIProxyHub\\settings.json 存在，
+    #   则优先使用 LocalAppData\\AIProxyHub 作为 ROOT，使两种启动方式共享同一份 settings.json/api_key，
+    #   避免出现“网关与 Codex 使用不同 key 导致 401 Invalid API key”的隐蔽问题。
+    # - 若本机没有该 settings.json（纯源码首次运行/开发者常见），仍保持历史行为：使用项目目录作为 ROOT。
+    if not getattr(sys, "frozen", False):
+        try:
+            base = os.getenv("LOCALAPPDATA")
+            if not base:
+                home_local = os.path.join(os.path.expanduser("~"), "AppData", "Local")
+                if os.path.isdir(home_local):
+                    base = home_local
+            if base:
+                local_root = os.path.join(base, "AIProxyHub")
+                local_settings = os.path.join(local_root, "settings.json")
+                if os.path.exists(local_settings):
+                    return local_root
+        except Exception:
+            # 任何探测异常都不应影响源码运行
+            pass
+
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(sys.executable)
         portable_flag = os.path.join(exe_dir, "AIProxyHub.portable")
@@ -661,17 +683,75 @@ def _ensure_runtime_dir():
     os.makedirs(RUNTIME_DIR, exist_ok=True)
 
 
+def _try_truncate_file(path: str) -> bool:
+    """
+    尽力清空文件内容（降低敏感信息残留风险）。
+
+    注意：
+    - Windows 上文件可能被其它进程短暂占用；此函数只做 best-effort，不抛异常。
+    """
+    if not path:
+        return False
+    try:
+        with open(path, "r+b") as f:
+            try:
+                f.seek(0)
+            except Exception:
+                pass
+            f.truncate(0)
+        return True
+    except Exception:
+        return False
+
+
+def _schedule_delete_on_reboot(path: str) -> bool:
+    """
+    Windows: 若文件仍被占用无法删除，则计划在重启后删除（MoveFileExW）。
+
+    返回：是否成功写入“重启后删除”计划。
+    """
+    if not path or not _is_windows():
+        return False
+    try:
+        MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004
+        kernel32 = ctypes.windll.kernel32
+        kernel32.MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        kernel32.MoveFileExW.restype = wintypes.BOOL
+        return bool(kernel32.MoveFileExW(str(path), None, MOVEFILE_DELAY_UNTIL_REBOOT))
+    except Exception:
+        return False
+
+
 def _safe_unlink(path: str):
     if not path:
         return
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except FileNotFoundError:
-        # 竞态条件：其它清理线程可能已删除该文件；无需告警
-        return
-    except Exception as e:
-        log(f"[WARN] 删除临时文件失败: {path} - {e}")
+    # Windows 下子进程退出与句柄释放可能存在短暂竞态：少量重试可显著降低“WinError 5”噪声。
+    retries = 4 if _is_windows() else 1
+    for i in range(int(retries)):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        except FileNotFoundError:
+            # 竞态条件：其它清理线程可能已删除该文件；无需告警
+            return
+        except PermissionError as e:
+            # 尽力先清空内容，再重试删除（避免敏感配置长时间残留在 %TEMP%）
+            _try_truncate_file(path)
+            if i < retries - 1:
+                time.sleep(0.12 * (2**i))
+                continue
+            if _schedule_delete_on_reboot(path):
+                log(f"[WARN] 删除临时文件失败（已计划重启后删除）: {path} - {e}")
+            else:
+                log(f"[WARN] 删除临时文件失败: {path} - {e}")
+            return
+        except Exception as e:
+            if i < retries - 1 and _is_windows():
+                time.sleep(0.12 * (2**i))
+                continue
+            log(f"[WARN] 删除临时文件失败: {path} - {e}")
+            return
 
 
 def _is_windows():
@@ -1671,6 +1751,17 @@ def _sanitize_responses_body_bytes(body: bytes) -> bytes:
             # 兼容失败不应阻断请求
             pass
 
+        # ---- responses_websockets_v2 兼容（Codex WS v2）----
+        # Codex(v0.114.0+) 的 WS 形态会在顶层携带 `generate` 字段（用于 WS 协议自身的语义），
+        # 但上游 CLIProxyAPI 的 OpenAI-compat `/v1/responses` 会把它当成“不支持的参数”直接 400。
+        # 这里做最小可行兼容：在转发到上游前移除该字段。
+        try:
+            if "generate" in obj:
+                obj.pop("generate", None)
+                changed = True
+        except Exception:
+            pass
+
         tools = obj.get("tools")
         if isinstance(tools, list):
             new_tools = []
@@ -1837,6 +1928,34 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                     return
 
                 data = resp.read() or b""
+                # 诊断：对 4xx/5xx 记录摘要，便于定位 “Codex 请求体不兼容导致 400” 等问题（log() 会脱敏）
+                try:
+                    if int(status) >= 400:
+                        try:
+                            snip = data.decode("utf-8", errors="replace")[:800]
+                        except Exception:
+                            snip = ""
+                        summary = ""
+                        try:
+                            ro = json.loads((body or b"").decode("utf-8", errors="replace"))
+                            if isinstance(ro, dict):
+                                model_s = str(ro.get("model") or "")
+                                keys_s = ",".join(sorted([str(k) for k in ro.keys()]))[:500]
+                                tool_types = []
+                                tools2 = ro.get("tools")
+                                if isinstance(tools2, list):
+                                    for t in tools2:
+                                        if isinstance(t, dict):
+                                            tt = str(t.get("type") or "").strip()
+                                            if tt:
+                                                tool_types.append(tt)
+                                tool_types_s = ",".join(sorted(set(tool_types)))[:300]
+                                summary = f"model={model_s} keys={keys_s} tool_types={tool_types_s}"
+                        except Exception:
+                            summary = ""
+                        log(f"[GW][HTTP] upstream status={status} path={self.path} ct={content_type} {summary} body={snip}")
+                except Exception:
+                    pass
                 self.send_response(status)
                 for hk, hv in headers:
                     lk = str(hk or "").lower()
@@ -2221,6 +2340,33 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                             raw = resp.read() or b""
                         except Exception:
                             raw = b""
+                        # 诊断：记录上游非 SSE 的错误摘要（log() 会做通用脱敏，避免泄露密钥）
+                        try:
+                            try:
+                                snip = raw.decode("utf-8", errors="replace")[:800]
+                            except Exception:
+                                snip = ""
+                            summary = ""
+                            try:
+                                ro = json.loads((body or b"").decode("utf-8", errors="replace"))
+                                if isinstance(ro, dict):
+                                    model_s = str(ro.get("model") or "")
+                                    keys_s = ",".join(sorted([str(k) for k in ro.keys()]))[:500]
+                                    tool_types = []
+                                    tools2 = ro.get("tools")
+                                    if isinstance(tools2, list):
+                                        for t in tools2:
+                                            if isinstance(t, dict):
+                                                tt = str(t.get("type") or "").strip()
+                                                if tt:
+                                                    tool_types.append(tt)
+                                    tool_types_s = ",".join(sorted(set(tool_types)))[:300]
+                                    summary = f"model={model_s} keys={keys_s} tool_types={tool_types_s}"
+                            except Exception:
+                                summary = ""
+                            log(f"[GW][WS] upstream non-sse status={status} ct={content_type} {summary} body={snip}")
+                        except Exception:
+                            pass
                         _send_error(status, raw.decode("utf-8", errors="replace"))
                         continue
 
@@ -3567,6 +3713,9 @@ _monitor_stats = {
     "last_pct": 0,
     "last_candidates": 0,
     "last_deleted": 0,
+    # 自动注册跳过原因（例如缺少 DuckMail Token/依赖），用于避免后台重复失败刷屏
+    "last_autoreg_skip_ts": 0.0,
+    "last_autoreg_skip_msg": "",
 }
 
 
@@ -3688,6 +3837,8 @@ def _monitor_prune_zero_quota(q: dict, cfg: dict) -> dict:
 def _monitor_loop():
     """后台监控线程：定期检查配额；可选：自动注册 / 自动清理额度为零账号。"""
     global _monitor_running
+    last_autoreg_skip_log_ts = 0.0
+    last_autoreg_skip_log_msg = ""
     cfg0 = _monitor_get_cfg()
     log(
         "[MONITOR] 自动监控已启动"
@@ -3728,13 +3879,28 @@ def _monitor_loop():
             threshold = int(cfg.get("low_available_threshold_pct", 20) or 20)
             if cfg.get("auto_register_enabled") and pct < threshold and not (register_process and register_process.poll() is None):
                 s = load_settings()
-                batch = int(s.get("total_accounts", 50))
-                log(
-                    f"[MONITOR] 可用率 {pct}% < {threshold}%，"
-                    f"自动启动注册 {batch} 个账号（并发 {s.get('max_workers', 5)}）"
-                )
-                r = run_register()
-                log(f"[MONITOR] 注册触发结果: {r.get('msg', '?')}")
+                # 先做一次预检：缺少 DuckMail token/依赖时不要重复触发 run_register 刷屏
+                ok2, msg2 = preflight("register", s)
+                if not ok2:
+                    now_ts = time.time()
+                    with _monitor_stats_lock:
+                        _monitor_stats.update({
+                            "last_autoreg_skip_ts": now_ts,
+                            "last_autoreg_skip_msg": str(msg2 or ""),
+                        })
+                    # rate-limit：5 分钟内同原因只提示一次；原因变化则立即提示
+                    if (now_ts - float(last_autoreg_skip_log_ts or 0)) > 300 or str(msg2 or "") != str(last_autoreg_skip_log_msg or ""):
+                        log(f"[MONITOR] 自动注册跳过：{msg2}")
+                        last_autoreg_skip_log_ts = now_ts
+                        last_autoreg_skip_log_msg = str(msg2 or "")
+                else:
+                    batch = int(s.get("total_accounts", 50))
+                    log(
+                        f"[MONITOR] 可用率 {pct}% < {threshold}%，"
+                        f"自动启动注册 {batch} 个账号（并发 {s.get('max_workers', 5)}）"
+                    )
+                    r = run_register()
+                    log(f"[MONITOR] 注册触发结果: {r.get('msg', '?')}")
 
             with _monitor_stats_lock:
                 _monitor_stats.update({
@@ -3952,6 +4118,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-seri
     <div class="stat"><div class="stat-label">注册任务</div><div class="stat-value" id="d-reg">--</div></div>
     <div class="stat"><div class="stat-label">已注册账号</div><div class="stat-value num" id="d-count">--</div></div>
     <div class="stat"><div class="stat-label">代理端口</div><div class="stat-value num" id="d-port">--</div></div>
+    <div class="stat"><div class="stat-label">后台监控</div><div class="stat-value" id="d-mon">--</div></div>
+    <div class="stat"><div class="stat-label">可用率</div><div class="stat-value num" id="d-mon-pct">--</div></div>
     <div class="stat"><div class="stat-label">总请求数</div><div class="stat-value num" id="d-usage-req">--</div></div>
     <div class="stat"><div class="stat-label">总 Tokens</div><div class="stat-value num" id="d-usage-tokens">--</div></div>
     <div class="stat"><div class="stat-label">缓存命中</div><div class="stat-value num" id="d-cache-hit">--</div></div>
@@ -4327,6 +4495,28 @@ async function refreshStatus(){
       }else{
         $('d-cache-hit').textContent='--';
         $('d-cache-ratio').textContent='--';
+      }
+    }catch(e){}
+    // 后台监控（自动清理/自动注册）状态摘要
+    try{
+      const m=r.monitor||{};
+      if(m && m.ok){
+        const enabled=!!(m.cfg && m.cfg.enabled);
+        const running=!!m.running;
+        const st=m.stats||{};
+        const mText= running?'运行中':(enabled?'未启动':'关闭');
+        $('d-mon').textContent=mText;
+        $('d-mon').className='stat-value '+(running?'on':'off');
+        const pct2=(st.last_pct??null);
+        $('d-mon-pct').textContent=((pct2===0||pct2)?String(pct2)+'%':'--');
+        let hint='';
+        if(st.last_autoreg_skip_msg) hint+='自动注册跳过: '+String(st.last_autoreg_skip_msg);
+        if(st.last_msg) hint+=(hint?' | ':'')+String(st.last_msg);
+        $('d-mon').title=hint;
+        $('d-mon-pct').title=hint;
+      }else{
+        $('d-mon').textContent='--';
+        $('d-mon-pct').textContent='--';
       }
     }catch(e){}
     $('r-proxy').textContent=proxyText;$('r-proxy').className='stat-value '+cls(r.proxy);$('r-proxy').title=proxyTitle;

@@ -1,10 +1,10 @@
-param(
-  # 透传给 codex 的参数（例如：/model、--help 等）
-  [Parameter(ValueFromRemainingArguments = $true)]
-  [string[]]$CodexArgs
-)
-
 $ErrorActionPreference = "Stop"
+
+# 透传给 codex 的参数（例如：/model、-p profile、--help 等）
+# 说明：
+# - 不使用 param + ValueFromRemainingArguments，是为了避免 PowerShell 的“通用参数缩写”
+#   把 `-p` 误判为 `-ProgressAction/-PipelineVariable` 等，导致无法把参数透传给 codex。
+$CodexArgs = @($args)
 
 function _FirstExistingFile([string[]]$candidates) {
   foreach ($p in $candidates) {
