@@ -128,7 +128,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.13"
+APP_VERSION = "1.2.14"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -1066,13 +1066,23 @@ def preflight(kind: str, s: dict):
             return False, f"端口 {port} 已被占用，请修改“监听端口”或先停止占用进程"
 
     # register/autopilot 相关
-    if kind in ("register", "autopilot"):
+    #
+    # 重要：autopilot 允许“先把代理跑起来 + 清理账号”，即使未配置 DuckMail Token 也不应整条链路失败；
+    #      此时会在阶段3自动跳过注册（见 auto_pilot）。
+    if kind == "register":
         if not str(s.get("duckmail_token", "")).strip():
             return False, "请先在“配置”页填写 DuckMail API Token"
         try:
             import curl_cffi  # noqa: F401
         except Exception:
             return False, "缺少依赖 curl_cffi：请使用“启动.bat”启动（会自动安装依赖）"
+    elif kind == "autopilot":
+        # 仅当确实需要走注册阶段时才校验依赖
+        if str(s.get("duckmail_token", "")).strip():
+            try:
+                import curl_cffi  # noqa: F401
+            except Exception:
+                return False, "缺少依赖 curl_cffi：请使用“启动.bat”启动（会自动安装依赖）"
 
     return True, ""
 
@@ -3651,7 +3661,19 @@ def auto_pilot():
         log("[AUTO] 已取消")
         return
 
-    # 阶段3：注册
+    # 阶段3：注册（可选）
+    if not str(s.get("duckmail_token", "")).strip():
+        # 用户未配置 DuckMail Token：仍然认为“启动代理 + 清理无效账号”成功完成，避免误判为不稳定。
+        n = len(get_accounts())
+        autopilot_state = {
+            "phase": "done",
+            "msg": f"代理已启动并完成清理；DuckMail Token 未设置，已跳过注册（当前 {n} 个账号在线）",
+        }
+        log("[AUTO] ▶ 阶段3：跳过批量注册（DuckMail Token 未设置）")
+        log(f"[AUTO] ✓ 全流程完成（跳过注册），{n} 个账号可用")
+        log(f"[AUTO] ✓ API: http://localhost:{s['proxy_port']}/v1  Key: {s['api_key']}")
+        return
+
     autopilot_state = {"phase": "register", "msg": f"正在注册 {s['total_accounts']} 个账号..."}
     log("[AUTO] ▶ 阶段3：开始批量注册")
     rr = run_register()
