@@ -128,7 +128,7 @@ PROXY_CONFIG = os.path.join(ROOT, "config.yaml")  # legacy (不再默认写入)
 REGISTER_CONFIG = os.path.join(ROOT, "register", "config.json")  # legacy (不再默认写入)
 AUTH_DIR = os.path.expanduser("~/.cli-proxy-api")
 DATA_DIR = os.path.join(ROOT, "data")
-APP_VERSION = "1.2.14"
+APP_VERSION = "1.2.15"
 LAUNCHER_HOST = "127.0.0.1"
 LAUNCHER_PORT = 9090
 
@@ -1964,6 +1964,11 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                         except Exception:
                             summary = ""
                         log(f"[GW][HTTP] upstream status={status} path={self.path} ct={content_type} {summary} body={snip}")
+                        if int(status) in (429, 403) or "usage_limit" in snip.lower() or "insufficient_quota" in snip.lower():
+                            try:
+                                _monitor_wake.set()
+                            except Exception:
+                                pass
                 except Exception:
                     pass
                 self.send_response(status)
@@ -2375,6 +2380,11 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
                             except Exception:
                                 summary = ""
                             log(f"[GW][WS] upstream non-sse status={status} ct={content_type} {summary} body={snip}")
+                            if int(status) in (429, 403) or "usage_limit" in snip.lower() or "insufficient_quota" in snip.lower():
+                                try:
+                                    _monitor_wake.set()
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                         _send_error(status, raw.decode("utf-8", errors="replace"))
@@ -3725,6 +3735,7 @@ def stop_auto_pilot():
 # --- 自动监控：配额不足自动注册，额度用完自动删除 ---
 _monitor_running = False
 _monitor_cancel = threading.Event()
+_monitor_wake = threading.Event()
 _monitor_stats_lock = threading.Lock()
 _monitor_stats = {
     "last_run_ts": 0.0,
@@ -3938,7 +3949,15 @@ def _monitor_loop():
         except Exception as e:
             log(f"[MONITOR] 监控异常: {e}")
 
-        _monitor_cancel.wait(int(cfg.get("interval_seconds", 60) or 60))
+        interval = int(cfg.get("interval_seconds", 60) or 60)
+        _monitor_wake.clear()
+        for _ in range(interval):
+            if _monitor_cancel.is_set():
+                break
+            if _monitor_wake.wait(timeout=1.0):
+                _monitor_wake.clear()
+                log("[MONITOR] received immediate check request")
+                break
 
     _monitor_running = False
     log("[MONITOR] 自动监控已停止")
@@ -3981,6 +4000,13 @@ def get_monitor_status():
     with _monitor_stats_lock:
         st = dict(_monitor_stats)
     return {"ok": True, "running": _monitor_running, "cfg": cfg, "stats": st}
+
+
+def trigger_monitor_now():
+    if not _monitor_running:
+        return {"ok": False, "msg": "monitor not running"}
+    _monitor_wake.set()
+    return {"ok": True, "msg": "immediate check triggered"}
 
 
 # ==================== HTML 前端 ====================
@@ -4996,6 +5022,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json(stop_monitor())
                 elif ep == "monitor_status":
                     self._json(get_monitor_status())
+                elif ep == "trigger_monitor":
+                    self._json(trigger_monitor_now())
                 elif ep == "cache_clear":
                     _cache_clear()
                     self._json({"ok": True, "msg": "缓存已清空", "cache": _cache_stats()})
