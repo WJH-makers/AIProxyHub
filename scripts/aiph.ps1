@@ -20,7 +20,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$AIPH_DIR = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$_scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$AIPH_DIR = (Resolve-Path (Join-Path $_scriptDir '..')).Path
 $AIPH_EXE = Join-Path $AIPH_DIR 'cli-proxy-api.exe'
 $AIPH_PORT = 8317
 $PROCESS_NAME = 'cli-proxy-api'
@@ -31,7 +32,13 @@ $APP_DATA_DIR = Join-Path $env:LOCALAPPDATA 'AIProxyHub'
 $CODEX_CONFIG = Join-Path $env:USERPROFILE '.codex\config.toml'
 
 function Get-AiphProcess {
-    Get-Process -Name $PROCESS_NAME -ErrorAction SilentlyContinue
+    # launcher.py (python) 或 cli-proxy-api.exe 任意一个在跑都算运行中
+    $py = Get-Process -Name 'python','pythonw' -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.MainModule.FileName -like '*AIProxyHub*' -or ($_.CommandLine -and $_.CommandLine -like '*launcher.py*') } catch { $false }
+    }
+    $go = Get-Process -Name $PROCESS_NAME -ErrorAction SilentlyContinue
+    if ($py) { return $py }
+    return $go
 }
 
 function Test-PortListening {
@@ -81,52 +88,63 @@ print('OK: ' + RUNTIME_PROXY_CONFIG)
 }
 
 function Start-Aiph {
-    $existing = Get-AiphProcess
-    if ($existing) {
-        Write-Host "[OK] AIProxyHub already running (PID $($existing.Id))" -ForegroundColor Green
+    # 检查 launcher (python) 或 cli-proxy-api 是否已在运行
+    $goProcs = Get-Process -Name $PROCESS_NAME -ErrorAction SilentlyContinue
+    if ($goProcs) {
+        Write-Host "[OK] AIProxyHub already running (PID $($goProcs[0].Id))" -ForegroundColor Green
         return
     }
 
-    $yaml = Ensure-RuntimeConfig
-    Write-Host "[...] Starting AIProxyHub on :$AIPH_PORT ..." -ForegroundColor Yellow
-
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $AIPH_EXE
-    $psi.Arguments = "-config `"$yaml`""
-    $psi.WorkingDirectory = $AIPH_DIR
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardOutput = $false
-    $psi.RedirectStandardError = $false
-    $psi.EnvironmentVariables['HOME'] = $env:USERPROFILE
-    $psi.EnvironmentVariables['USERPROFILE'] = $env:USERPROFILE
-
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $null = $proc.Handle
-
-    Start-Sleep -Seconds 3
-
-    if ($proc.HasExited) {
-        Write-Host "[FAIL] Process exited with code $($proc.ExitCode)" -ForegroundColor Red
-        return
+    # 通过 launcher.py 启动（它内部管理 cli-proxy-api.exe + gateway + monitor）
+    $venv_python = Join-Path $AIPH_DIR '.venv\Scripts\pythonw.exe'
+    if (-not (Test-Path $venv_python)) {
+        $venv_python = Join-Path $AIPH_DIR '.venv\Scripts\python.exe'
     }
+    $launcherPy = Join-Path $AIPH_DIR 'launcher.py'
 
-    if (Test-PortListening) {
-        Write-Host "[OK] AIProxyHub started (PID $($proc.Id), port $AIPH_PORT)" -ForegroundColor Green
+    Write-Host "[...] Starting AIProxyHub on :$AIPH_PORT (via launcher.py) ..." -ForegroundColor Yellow
+
+    $env:HOME = $env:USERPROFILE
+    $env:AIPROXYHUB_NO_PAUSE = '1'
+    Start-Process -FilePath $venv_python -ArgumentList "$launcherPy","--no-browser","--host","127.0.0.1" -WorkingDirectory $AIPH_DIR -WindowStyle Hidden
+
+    # 等待 launcher 启动并让 cli-proxy-api.exe 就绪
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Seconds 1
+        if (Test-PortListening) {
+            Write-Host "[OK] AIProxyHub started (port $AIPH_PORT, monitor enabled)" -ForegroundColor Green
+            return
+        }
+    }
+    $goProcs2 = Get-Process -Name $PROCESS_NAME -ErrorAction SilentlyContinue
+    if ($goProcs2) {
+        Write-Host "[OK] AIProxyHub started (PID $($goProcs2[0].Id), port may still be initializing)" -ForegroundColor Yellow
     } else {
-        Write-Host "[WARN] Process running (PID $($proc.Id)) but port $AIPH_PORT not yet ready" -ForegroundColor Yellow
+        Write-Host "[WARN] Launcher started but proxy port $AIPH_PORT not yet ready" -ForegroundColor Yellow
     }
 }
 
 function Stop-Aiph {
-    $procs = Get-AiphProcess
-    if (-not $procs) {
-        Write-Host "[OK] AIProxyHub not running" -ForegroundColor Yellow
-        return
+    # 停止 launcher (python) 和 cli-proxy-api.exe
+    $stopped = 0
+    foreach ($name in @($PROCESS_NAME, 'python', 'pythonw')) {
+        $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            $isAiph = $false
+            try {
+                if ($name -eq $PROCESS_NAME) { $isAiph = $true }
+                elseif ($p.MainModule.FileName -like '*AIProxyHub*') { $isAiph = $true }
+                elseif ($p.CommandLine -and $p.CommandLine -like '*launcher.py*') { $isAiph = $true }
+            } catch {}
+            if ($isAiph) {
+                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                Write-Host "[OK] Stopped $name PID $($p.Id)" -ForegroundColor Green
+                $stopped++
+            }
+        }
     }
-    foreach ($p in $procs) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        Write-Host "[OK] Stopped PID $($p.Id)" -ForegroundColor Green
+    if ($stopped -eq 0) {
+        Write-Host "[OK] AIProxyHub not running" -ForegroundColor Yellow
     }
 }
 
