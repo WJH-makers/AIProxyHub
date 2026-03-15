@@ -165,7 +165,7 @@ def _ws_build_client_frame_text(payload_text: str) -> bytes:
     else:
         out.append(mask_bit | 127)
         out.extend(ln.to_bytes(8, "big"))
-    mask_key = random.randbytes(4) if hasattr(random, "randbytes") else bytes([random.randrange(256) for _ in range(4)])
+    mask_key = os.urandom(4)
     out.extend(mask_key)
     masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
     out.extend(masked)

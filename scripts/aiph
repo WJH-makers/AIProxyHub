@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# AIProxyHub quick control (delegates to PowerShell)
+# Usage: aiph start|stop|status|restart|log|auto on|off|failover|switch local|cloud
+powershell.exe -ExecutionPolicy Bypass -File "E:/AIProxyHub/scripts/aiph.ps1" "$@"

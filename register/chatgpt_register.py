@@ -570,12 +570,13 @@ def _generate_password(length=14):
     upper = string.ascii_uppercase
     digits = string.digits
     special = "!@#$%&*"
-    pwd = [random.choice(lower), random.choice(upper),
-           random.choice(digits), random.choice(special)]
+    pwd = [secrets.choice(lower), secrets.choice(upper),
+           secrets.choice(digits), secrets.choice(special)]
     all_chars = lower + upper + digits + special
-    pwd += [random.choice(all_chars) for _ in range(length - 4)]
-    random.shuffle(pwd)
-    return "".join(pwd)
+    pwd += [secrets.choice(all_chars) for _ in range(length - 4)]
+    pwd_list = list(pwd)
+    secrets.SystemRandom().shuffle(pwd_list)
+    return "".join(pwd_list)
 
 
 # ================= DuckMail 邮箱函数 =================
