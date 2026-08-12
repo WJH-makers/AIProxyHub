@@ -82,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-installer-nsis.ps1
 - 缓存可能包含 prompt/response 内容；默认关闭，启用前请确认本机和团队的数据边界。
 - 默认代理端口 8317 被其他本机服务占用时，AIProxyHub 会自动选择并保存一个可用端口；管理面板仍会显示实际地址。
 - 本项目本身不运营托管服务，默认不收集遥测；数据保留和 provider 侧处理取决于用户配置。详见 [PRIVACY.md](PRIVACY.md) 和 [SECURITY.md](SECURITY.md)。
-- **2.0 之前的 tag 和 Release 资产仍保留在本仓库，且包含上面第三条所列的、已被移除的注册链功能。** 它们仅作历史留存，不受支持，请勿下载、构建或运行。只有 `main` 与 2.0+ 的 Release 符合当前声明的项目边界。详见 [SECURITY.md](SECURITY.md) 的 Pre-2.0 history 一节。
+- **2.0 之前的 tag、Release 资产和旧 feature 分支已撤回，不再属于受支持的公开项目面。** 它们曾包含已被移除的注册链功能，不应下载、构建或运行。只有当前 `main` 与 2.0+ 的 Release 符合本项目声明的边界。Git 托管服务可能在垃圾回收前仍保留不可达对象；详见 [SECURITY.md](SECURITY.md) 的 Pre-2.0 history 一节。
 
 ## 维护与工具辅助署名
 

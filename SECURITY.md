@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the current `main` branch and the latest published release are expected to receive security fixes. Older releases may still contain removed features and should not be used for new deployments.
+Only the current `main` branch and 2.0+ releases receive security fixes. Pre-2.0 refs and artifacts are withdrawn and must not be used for new deployments.
 
 ## Scope and security boundaries
 
@@ -38,17 +38,17 @@ challenge emulation, fake registration data, and consumer OAuth token
 extraction). That workflow is removed from the current `main`, and the branch
 history was rewritten.
 
-**Pre-2.0 tags and their release assets are still published in this
-repository.** They are retained for historical continuity, and they still
-contain the workflow described above. They are unsupported: do not download,
-build, or run them. Only `main` and 2.0+ releases reflect the current,
-policy-compliant scope described in the README.
+**Pre-2.0 tags, release assets, and the old feature branch are withdrawn from
+the public repository surface.** They contained the workflow described above
+and must not be downloaded, built, or run. Only `main` and 2.0+ releases
+reflect the current, policy-compliant scope described in the README.
 
-Rewriting `main` did not remove those objects, and it could not have: Git
-does not forget on its own. Even if the referencing tags and releases were
-deleted, the underlying objects would remain reachable by explicit commit SHA
-on the hosting provider until GitHub Support garbage-collects unreachable
-objects on request.
+Rewriting `main` and deleting the old public refs does not immediately erase
+those objects: Git hosting services may retain unreachable objects that still
+resolve by explicit commit SHA until their garbage-collection process runs.
+If an old object remains directly reachable after the public refs are removed,
+the maintainer will ask GitHub Support to garbage-collect it; the project will
+not claim physical erasure before that has been confirmed.
 
 No live provider credential was found in the removed code; it used placeholder
 values only. Anyone who ran a pre-2.0 build against real accounts should review
