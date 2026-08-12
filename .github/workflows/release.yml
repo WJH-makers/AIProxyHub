@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Validate source before release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run quality gates
+        run: |
+          python -m ruff check launcher.py launcher_monitor.py launcher_security.py launcher_settings.py --select E9,F821,F823,F811,F841
+          python -m compileall -q launcher.py launcher_monitor.py launcher_security.py launcher_settings.py tests
+          python -m pytest -q
+
+      - name: Confirm removed registration workflow stays absent
+        run: |
+          test -z "$(git ls-files | grep -E '(^|/)(register|chatgpt_register|protocol_keygen)' || true)"
+          if rg -n -i --glob '*.py' --glob '*.ps1' --glob '*.bat' --glob '*.cmd' --glob '!smoke-release-exe.py' \
+            'duckmail\.sbs|openai-sentinel-token|sentinel\.openai|email-otp|AIPROXYHUB_REGISTER|register-worker|register/chatgpt_register|protocol_keygen' .; then
+            echo "removed account-registration workflow found"
+            exit 1
+          fi
+
+      - name: Scan source for obvious secrets
+        run: |
+          if rg -n --hidden --glob '!.git/**' --glob '!*.md' --glob '!*.yml' --glob '!*.yaml' \
+            --glob '*.py' --glob '*.ps1' --glob '*.bat' --glob '*.cmd' --glob '*.toml' --glob '*.ini' --glob '*.json' \
+            'BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY|sk-[A-Za-z0-9]{24,}|gh[pousr]_[A-Za-z0-9]{20,}' .; then
+            echo "possible secret pattern found"
+            exit 1
+          fi
+
+  package:
+    name: Build verified Windows package
+    runs-on: windows-latest
+    needs: validate
+    permissions:
+      contents: read
+    env:
+      CLIPROXYAPI_TAG: v7.2.128
+      CLIPROXYAPI_SHA256: 5676DDAEF47FB64EA9806D6D35C4BE9600BED4625CF6BD4B65F1A00E527D5A8A
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create build environment
+        shell: pwsh
+        run: python -m venv .venv
+
+      - name: Install and verify CLIProxyAPI
+        shell: pwsh
+        run: |
+          .\scripts\get-cliproxyapi.ps1 -Tag $env:CLIPROXYAPI_TAG -ExpectedSha256 $env:CLIPROXYAPI_SHA256
+
+      - name: Build release package
+        shell: pwsh
+        run: .\scripts\build-release.ps1
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiproxyhub-windows-release
+          path: release/*
+          if-no-files-found: error
+
+  gh_release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: package
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Windows release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: aiproxyhub-windows-release
+          path: release
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*

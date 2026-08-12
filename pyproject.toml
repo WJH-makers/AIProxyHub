@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# The legacy launcher intentionally has broad defensive exception handling and
+# import ordering that is outside the first OSS quality gate. Keep the CI gate
+# focused on syntax, undefined names, duplicate definitions, and dead locals.
+select = ["E9", "F821", "F823", "F811", "F841"]

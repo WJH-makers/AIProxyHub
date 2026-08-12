@@ -1,0 +1,2 @@
+# zstandard is required for Codex/client request compression normalization.
+zstandard==0.25.0

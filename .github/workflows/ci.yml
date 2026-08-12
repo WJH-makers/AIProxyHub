@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Focused lint
+        run: python -m ruff check launcher.py launcher_monitor.py launcher_security.py launcher_settings.py --select E9,F821,F823,F811,F841
+
+      - name: Compile Python sources
+        run: python -m compileall -q launcher.py launcher_monitor.py launcher_security.py launcher_settings.py tests
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Check removed account-registration workflow
+        shell: bash
+        run: |
+          test -z "$(git ls-files | grep -E '(^|/)(register|chatgpt_register|protocol_keygen)' || true)"
+          if rg -n -i --glob '*.py' --glob '*.ps1' --glob '*.bat' --glob '!smoke-release-exe.py' \
+            'duckmail\.sbs|openai-sentinel-token|sentinel\.openai|email-otp|AIPROXYHUB_REGISTER|register-worker|register/chatgpt_register|protocol_keygen' launcher.py launcher_monitor.py scripts tests; then
+            echo "removed account-registration workflow found"
+            exit 1
+          fi
+
+      - name: Basic secret pattern scan
+        shell: bash
+        run: |
+          if rg -n --hidden --glob '!.git/**' --glob '!*.md' --glob '!*.yml' \
+            'BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY|sk-[A-Za-z0-9]{24,}|gh[pousr]_[A-Za-z0-9]{20,}' .; then
+            echo "possible secret pattern found"
+            exit 1
+          fi
