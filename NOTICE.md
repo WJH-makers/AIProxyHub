@@ -7,6 +7,7 @@ AIProxyHub 是独立的整合与管理项目。它不声称拥有下列第三方
 ## CLIProxyAPI
 
 - 来源：https://github.com/router-for-me/CLIProxyAPI
+- 固定版本：v7.2.129，exe SHA-256 `45192C808339F17778574616FBDBAD8BB1FA1239AD4EFF90E87C221B4DDE50FE`（见 `cli-proxy-api.provenance.json`）
 - 用途：提供用户已授权 provider 的 OpenAI-compatible 代理和管理接口；AIProxyHub 只负责本地启动、配置和管理面板整合。
 - 许可证：上游 MIT License。发布包含其可执行文件时，必须保留上游版权和许可声明。
 

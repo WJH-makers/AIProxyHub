@@ -1,8 +1,16 @@
 # AIProxyHub
 
+[![CI](https://github.com/WJH-makers/AIProxyHub/actions/workflows/ci.yml/badge.svg)](https://github.com/WJH-makers/AIProxyHub/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/WJH-makers/AIProxyHub/actions/workflows/codeql.yml/badge.svg)](https://github.com/WJH-makers/AIProxyHub/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 AIProxyHub 是一个面向 Windows 的本地优先 AI 网关管理器：负责启动和管理用户已经授权的 provider、提供 OpenAI-compatible 转发接口、可选的请求级缓存、用量摘要、健康监控和可审计的运行日志。
 
 它不是账号生成器，也不是订阅共享或限额规避工具。AIProxyHub 不创建第三方账户、不使用临时邮箱或 OTP、不模拟反滥用挑战、不生成虚假身份、不批量提取消费者 OAuth token，也不自动轮换账户来规避 provider 使用限制。用户必须自行提供有权使用的 provider 配置，并遵守适用的服务协议。
+
+## 项目状态
+
+早期阶段，单人维护；截至 2026-08-12，GitHub 公开指标为 5 stars、0 forks，未宣称月度下载量。当前重点是把边界、测试和发布流程做扎实，而不是扩功能面。请按「早期项目」评估它：接口可能变化，遇到问题请开 Issue。
 
 ## 主要能力
 
@@ -10,6 +18,7 @@ AIProxyHub 是一个面向 Windows 的本地优先 AI 网关管理器：负责�
 - CLIProxyAPI 生命周期管理：运行时配置写入系统临时目录，敏感设置在 Windows 上使用 DPAPI 保护。
 - OpenAI-compatible gateway：可选支持 `/v1/responses` 与 `/v1/chat/completions` 的请求级缓存、singleflight、大小/数量/内存上限和 stale 策略。
 - 缓存隔离：缓存 key 始终包含客户端 `Authorization` 边界，并保留项目/组织/租户 header 维度；不提供跨 API Key 共享缓存。
+- 网关限流：每个客户端凭据独立的 RPM 滑动窗口（超限返回 429 + `Retry-After`）加全局在途请求上限（满载返回 503）。默认开启，用于防止单个客户端或重试风暴烧光用户自己的上游额度；这是本地闸门，不是绕过上游限制的手段。
 - 只读健康监控：只检查本地代理可达性和用量摘要，不删除、创建、上传或轮换 provider 凭据。
 - 发布冒烟与自动化检查：测试、编译、Focused lint、秘密扫描和发布前构建检查。
 
@@ -31,7 +40,7 @@ python -m venv .venv
 
 默认管理面板只监听 `127.0.0.1`。EXE 版默认将设置和运行数据保存到 `%LOCALAPPDATA%\AIProxyHub`；可以使用 `AIPROXYHUB_HOME` 指定隔离目录，或在 EXE 同目录创建 `AIProxyHub.portable` 使用便携模式。
 
-首次启动会生成随机的管理密码和客户端 API Key。设置文件中的敏感字段由 Windows DPAPI 保护；日志和页面不会默认回显密钥。远程监听必须显式使用 `--allow-remote`，并设置独立且足够强的 `admin_api_key`，同时做好网络隔离。
+首次启动会生成随机的管理密码和客户端 API Key。设置文件中的敏感字段由 Windows DPAPI 保护；日志和页面不会默认回显密钥。远程监听必须显式使用 `--allow-remote`，并设置独立且足够强的 `admin_api_key`，同时做好网络隔离；程序会拒绝远程监听时复用客户端 API Key。
 
 ## 客户端接入
 
@@ -66,7 +75,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-installer-nsis.ps1
 ## 项目边界与安全
 
 - 只支持 BYOK/BYOA：用户主动配置自己有权使用的 provider/API credential。
+- 网关和管理面板默认只监听本机；远程网关必须在配置页显式开启，且同时设置独立管理 API Key、强随机客户端 Key 和网络隔离。
 - 不支持消费者账号批量创建、临时邮箱收码、验证码提取、反机器人挑战模拟、虚假注册信息、账号农场、凭据转售或 quota-evasion failover。
+- 不会因上游配额错误自动切换项目、模型类别、账号或外部 provider；配额和授权问题必须按 provider 的正规流程处理。
 - 不要将 `settings.json`、`data/`、`.env`、provider auth 文件或任何 token 提交到仓库。
 - 缓存可能包含 prompt/response 内容；默认关闭，启用前请确认本机和团队的数据边界。
 - 默认代理端口 8317 被其他本机服务占用时，AIProxyHub 会自动选择并保存一个可用端口；管理面板仍会显示实际地址。
@@ -82,4 +93,4 @@ AIProxyHub 是独立开源项目，不隶属于、未获 OpenAI 或其他 provid
 
 ## 第三方组件
 
-本项目集成或分发 CLIProxyAPI 及 Python 依赖。来源、版本、许可证和分发边界见 [NOTICE.md](NOTICE.md) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。贡献代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+本项目集成或分发 CLIProxyAPI 及 Python 依赖。来源、版本、许可证和分发边界见 [NOTICE.md](NOTICE.md) 与 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。`config.example.yaml` 只保留不含 provider 专用账号流程的最小配置参考。贡献代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。

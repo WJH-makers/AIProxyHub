@@ -8,6 +8,29 @@ from helpers import isolated_launcher_fs
 
 @unittest.skipUnless(sys.platform.startswith("win"), "DPAPI 仅支持 Windows")
 class TestSettingsDPAPI(unittest.TestCase):
+    def test_retired_quota_switch_controls_are_removed(self):
+        with isolated_launcher_fs() as (launcher, _td):
+            with open(launcher.SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "quota_switch_project": True,
+                        "quota_switch_preview": True,
+                        "proxy": "http://127.0.0.1:7890",
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            settings = launcher.load_settings()
+
+            self.assertNotIn("quota_switch_project", settings)
+            self.assertNotIn("quota_switch_preview", settings)
+            with open(launcher.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                on_disk = json.load(f)
+            self.assertNotIn("quota_switch_project", on_disk)
+            self.assertNotIn("quota_switch_preview", on_disk)
+
     def test_migrates_plaintext_secrets_to_dpapi_on_load(self):
         with isolated_launcher_fs() as (launcher, _td):
             # 写入旧版“明文 secret” settings.json

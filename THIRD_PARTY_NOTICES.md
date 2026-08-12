@@ -4,7 +4,7 @@ This file records the third-party components intentionally used or distributed b
 
 | Component | Use in AIProxyHub | License / source |
 |---|---|---|
-| CLIProxyAPI | User-authorized provider gateway binary | MIT; https://github.com/router-for-me/CLIProxyAPI; full text in `licenses/CLIProxyAPI-LICENSE.txt` |
+| CLIProxyAPI v7.2.129 | User-authorized provider gateway binary | MIT; https://github.com/router-for-me/CLIProxyAPI; full text in `licenses/CLIProxyAPI-LICENSE.txt` |
 | zstandard 0.25.0 | Normalize client zstd-compressed requests | BSD 3-Clause; https://github.com/indygreg/python-zstandard; full text in `licenses/zstandard-LICENSE.txt` |
 | PyInstaller 6.22.0 | Windows executable packaging tool | GPL with bootloader exception; https://pyinstaller.org/; full text in `licenses/PyInstaller-COPYING.txt` |
 

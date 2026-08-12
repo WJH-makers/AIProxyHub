@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
 # AIProxyHub quick control (delegates to PowerShell)
-# Usage: aiph start|stop|status|restart|log|auto on|off|failover|switch local|cloud
-powershell.exe -ExecutionPolicy Bypass -File "E:/AIProxyHub/scripts/aiph.ps1" "$@"
+# Usage: aiph start|stop|status|restart|log|auto on|off
+set -e
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec powershell.exe -ExecutionPolicy Bypass -File "$SCRIPT_DIR/aiph.ps1" "$@"

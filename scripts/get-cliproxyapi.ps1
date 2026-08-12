@@ -1,5 +1,5 @@
 param(
-  # 默认下载 latest；正式发布建议显式传入固定 Tag。
+  # 默认读取仓库中固定的 provenance manifest；如需升级，必须显式更新 Tag 和 SHA-256。
   [string]$Tag = "",
   # 可选：对下载并解压出的 exe 做固定 SHA-256 校验。
   [string]$ExpectedSha256 = "",
@@ -14,6 +14,17 @@ $ErrorActionPreference = "Stop"
 
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $outExe = Join-Path $root "cli-proxy-api.exe"
+$provenancePath = Join-Path $root "cli-proxy-api.provenance.json"
+
+$known = $null
+if (Test-Path -LiteralPath $provenancePath) {
+  try { $known = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json } catch { throw "无法读取 provenance manifest：$provenancePath" }
+}
+if (-not $Tag.Trim() -and $known.release_tag) { $Tag = [string]$known.release_tag }
+if (-not $ExpectedSha256.Trim() -and $known.executable_sha256) { $ExpectedSha256 = [string]$known.executable_sha256 }
+if (-not $Tag.Trim() -or -not $ExpectedSha256.Trim()) {
+  throw "为避免不可审计的 latest 下载，请提供固定 -Tag 与 -ExpectedSha256，或先补齐 $provenancePath"
+}
 
 if ((Test-Path $outExe) -and (-not $Force)) {
   Write-Host "[CLIProxyAPI] 已存在：$outExe"
@@ -21,12 +32,30 @@ if ((Test-Path $outExe) -and (-not $Force)) {
   exit 0
 }
 
-$api = if ($Tag.Trim()) { "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/tags/$($Tag.Trim())" } else { "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest" }
+$api = "https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/tags/$($Tag.Trim())"
 Write-Host "[CLIProxyAPI] 获取 release 信息：$api"
 
-# GitHub API 要求 User-Agent
-$release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "AIProxyHub" }
-if (-not $release) { throw "无法读取 GitHub latest release：$api" }
+# GitHub API 要求 User-Agent。匿名调用限 60 次/小时，CI 或频繁构建下会撞限并
+# 报成"无法读取 release"，所以优先带上可用的 token；GITHUB_TOKEN 由 Actions 注入，
+# 本机则退回 gh 的凭据。
+$apiHeaders = @{ "User-Agent" = "AIProxyHub"; "Accept" = "application/vnd.github+json" }
+$ghToken = $env:GITHUB_TOKEN
+if (-not $ghToken) { $ghToken = $env:GH_TOKEN }
+if (-not $ghToken -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+  try { $ghToken = (& gh auth token 2>$null | Select-Object -First 1) } catch { $ghToken = $null }
+}
+if ($ghToken) {
+  $apiHeaders["Authorization"] = "Bearer $($ghToken.Trim())"
+  Write-Host "[CLIProxyAPI] 使用已认证的 GitHub API 调用（避开匿名限流）"
+}
+
+try {
+  $release = Invoke-RestMethod -Uri $api -Headers $apiHeaders
+} catch {
+  $hint = if ($ghToken) { "" } else { " 若为限流（HTTP 403），可先执行 gh auth login 或设置 GITHUB_TOKEN 后重试。" }
+  throw "无法读取 GitHub release：$api。原始错误：$($_.Exception.Message)$hint"
+}
+if (-not $release) { throw "无法读取 GitHub release：$api" }
 
 $asset = $null
 foreach ($a in ($release.assets | Where-Object { $_ })) {
@@ -97,7 +126,6 @@ try {
     asset_name = $name
     asset_url = $url
     executable_sha256 = $h
-    downloaded_at_utc = (Get-Date).ToUniversalTime().ToString("o")
   }
   $metaPath = Join-Path $root "cli-proxy-api.provenance.json"
   $meta | ConvertTo-Json -Depth 5 | Set-Content -Path $metaPath -Encoding utf8

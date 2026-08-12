@@ -16,8 +16,6 @@ class TestConfigGeneration(unittest.TestCase):
                 "proxy": "http://127.0.0.1:7890",
                 "routing_strategy": "round-robin",
                 "request_retry": 3,
-                "quota_switch_project": True,
-                "quota_switch_preview": True,
                 "debug": False,
             }
             launcher.generate_proxy_config(s, out)
@@ -31,6 +29,8 @@ class TestConfigGeneration(unittest.TestCase):
             self.assertIn("proxy-url:", text)
             self.assertIn("remote-management:", text)
             self.assertIn("api-keys:", text)
+            self.assertIn("switch-project: false", text)
+            self.assertIn("switch-preview-model: false", text)
 
             # 单引号应被 YAML escape（''）
             self.assertIn("pw''123", text)

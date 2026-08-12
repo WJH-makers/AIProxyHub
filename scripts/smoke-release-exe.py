@@ -21,6 +21,32 @@ import zipfile
 from pathlib import Path
 
 
+REQUIRED_RELEASE_FILES = {
+    "LICENSE",
+    "NOTICE.md",
+    "THIRD_PARTY_NOTICES.md",
+    "SECURITY.md",
+    "PRIVACY.md",
+    "MAINTAINERS.md",
+    "CHANGELOG.md",
+    "使用指南.md",
+    "API.md",
+    "cli-proxy-api.provenance.json",
+}
+FORBIDDEN_RELEASE_MARKERS = (
+    "duckmail.sbs",
+    "sentinel.openai",
+    "register-worker",
+    "register/",
+    "registered_accounts",
+    "codex_tokens/",
+    "ak.txt",
+    "rk.txt",
+    "protocol_keygen",
+    "chatgpt_register.py",
+)
+
+
 def http_json(url: str, *, headers: dict[str, str] | None = None, timeout: float = 5) -> tuple[int, dict]:
     request = urllib.request.Request(url, headers=headers or {})
     try:
@@ -112,6 +138,22 @@ def main() -> int:
     process: subprocess.Popen | None = None
     try:
         with zipfile.ZipFile(archive) as bundle:
+            names = {name.replace("\\", "/").rstrip("/") for name in bundle.namelist()}
+            missing = sorted(REQUIRED_RELEASE_FILES - names)
+            if missing:
+                raise RuntimeError(f"release archive is missing required compliance files: {missing}")
+            forbidden_names = sorted(
+                name for name in names if any(marker in name.lower() for marker in FORBIDDEN_RELEASE_MARKERS)
+            )
+            if forbidden_names:
+                raise RuntimeError(f"release archive contains removed workflow paths: {forbidden_names}")
+            provenance = json.loads(bundle.read("cli-proxy-api.provenance.json").decode("utf-8-sig"))
+            digest = str(provenance.get("executable_sha256", "")).strip()
+            if len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
+                raise RuntimeError("release provenance has no valid CLIProxyAPI SHA-256")
+            license_names = {name for name in names if name.startswith("licenses/")}
+            if not {"licenses/CLIProxyAPI-LICENSE.txt", "licenses/zstandard-LICENSE.txt"}.issubset(license_names):
+                raise RuntimeError(f"release archive is missing required third-party licenses: {sorted(license_names)}")
             bundle.extractall(extract_dir)
         exe = find_exe(extract_dir)
 
@@ -138,7 +180,7 @@ def main() -> int:
         for marker in ("AIProxyHub", "Codex"):
             if marker not in page:
                 raise RuntimeError(f"management page is missing expected marker: {marker}")
-        for forbidden in ("duckmail.sbs", "sentinel.openai", "register-worker", "protocol_keygen"):
+        for forbidden in FORBIDDEN_RELEASE_MARKERS:
             if forbidden.lower() in page.lower():
                 raise RuntimeError(f"management page contains removed workflow marker: {forbidden}")
         for header, expected in (("x-content-type-options", "nosniff"), ("x-frame-options", "DENY")):
@@ -151,6 +193,12 @@ def main() -> int:
         for secret in ("api_key", "management_password", "admin_api_key", "api_keys_extra"):
             if settings.get(secret):
                 raise RuntimeError(f"settings endpoint leaked secret field: {secret}")
+
+        for limit_field in ("gateway_rate_limit_rpm", "gateway_max_concurrent_requests"):
+            if int(settings.get(limit_field, 0) or 0) <= 0:
+                raise RuntimeError(
+                    f"packaged build ships with the gateway limit disabled: {limit_field}={settings.get(limit_field)!r}"
+                )
 
         code, _ = http_json(f"{base}/api/ext/status")
         if code != 401:

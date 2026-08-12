@@ -35,6 +35,20 @@ try {
     throw "未找到 cli-proxy-api.exe：$cliProxy。它属于第三方组件（CLIProxyAPI Windows 版本）。请先运行：powershell -ExecutionPolicy Bypass -File .\\scripts\\get-cliproxyapi.ps1（或手动下载并放到项目根目录）。"
   }
 
+  $provenancePath = Join-Path $root "cli-proxy-api.provenance.json"
+  if (-not (Test-Path -LiteralPath $provenancePath)) {
+    throw "未找到第三方二进制 provenance manifest：$provenancePath"
+  }
+  try {
+    $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
+    $expected = ([string]$provenance.executable_sha256).Trim().ToUpperInvariant()
+    if ($expected -notmatch '^[0-9A-F]{64}$') { throw 'provenance 中的 executable_sha256 无效' }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $cliProxy).Hash.ToUpperInvariant()
+    if ($actual -ne $expected) { throw "CLIProxyAPI SHA-256 不匹配：provenance=$expected，实际=$actual" }
+  } catch {
+    throw "第三方二进制 provenance 校验失败：$($_.Exception.Message)"
+  }
+
   $distDir = Join-Path $root "dist"
   $buildDir = Join-Path $root "build"
   foreach ($d in @($distDir, $buildDir)) {
@@ -48,12 +62,11 @@ try {
   }
 
   Write-Host "[2/5] PyInstaller 打包..."
-  $args = @("--noconfirm", "--clean", "--name", "AIProxyHub", "--add-binary", "cli-proxy-api.exe;.")
+  $args = @("--noconfirm", "--clean", "--name", "AIProxyHub", "--add-binary", ("{0};." -f $cliProxy))
   if ($OneDir) { $args += "--onedir" } else { $args += "--onefile" }
   if (-not $Console) { $args += "--noconsole" }
-  $args += "launcher.py"
 
-  & $py -m PyInstaller @args
+  & $py -m PyInstaller @args (Join-Path $root "launcher.py")
 
   if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller 失败，退出码 $LASTEXITCODE"
