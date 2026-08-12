@@ -16,7 +16,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # 署名守卫要扫完整分支历史；默认浅克隆会让它静默放行。
           fetch-depth: 0
@@ -90,7 +90,7 @@ jobs:
       CLIPROXYAPI_SHA256: 45192C808339F17778574616FBDBAD8BB1FA1239AD4EFF90E87C221B4DDE50FE
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -125,7 +125,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
