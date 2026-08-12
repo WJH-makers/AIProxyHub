@@ -150,6 +150,46 @@ def _coerce_port(value, default: int) -> int:
     return int(default)
 
 
+def _coerce_non_negative_int(value, default: int) -> int:
+    """Return a non-negative int, falling back instead of raising on bad settings.
+
+    An empty value means "explicitly cleared" and maps to 0 (limit off) rather
+    than to ``default``; otherwise clearing the field in the UI would silently
+    restore the default limit.
+    """
+    if value is None:
+        return int(default)
+    text = str(value).strip()
+    if not text:
+        return 0
+    try:
+        n = int(text)
+    except ValueError:
+        return int(default)
+    return n if n >= 0 else int(default)
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    """Parse persisted/UI booleans without treating the string ``"false"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off", ""}:
+        return False
+    return bool(default)
+
+
+def _runtime_dir_for_root(root: str) -> str:
+    """Return a private temp namespace for one AIProxyHub data root."""
+    normalized = os.path.normcase(os.path.abspath(str(root)))
+    namespace = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), "AIProxyHub", namespace)
+
+
 def _get_proxy_exe_path() -> str:
     """
     获取 CLIProxyAPI 可执行文件路径。
@@ -167,7 +207,7 @@ def _get_proxy_exe_path() -> str:
             return p
     return candidates[-1]
 
-RUNTIME_DIR = os.path.join(tempfile.gettempdir(), "AIProxyHub")
+RUNTIME_DIR = _runtime_dir_for_root(ROOT)
 RUNTIME_PROXY_CONFIG = os.path.join(RUNTIME_DIR, "cli-proxy-api.runtime.yaml")
 
 SECRET_FIELDS = ("management_password", "api_key", "admin_api_key", "api_keys_extra")
@@ -190,16 +230,19 @@ DEPRECATED_SETTINGS = {
     "keep_token_json",
     "keep_token_json_on_fail",
     "cache_shared_across_api_keys",
+    # Do not retain legacy quota-switch controls.  AIProxyHub never changes
+    # projects/models to work around an upstream usage limit.
+    "quota_switch_project",
+    "quota_switch_preview",
 }
 # 这些配置变更会影响 proxy（cli-proxy-api.exe 或透明网关）的行为；若代理正在运行，需要重启后生效。
 PROXY_RESTART_KEYS = {
     "proxy",
     "proxy_port",
     "proxy_host",
+    "allow_remote_proxy",
     "routing_strategy",
     "request_retry",
-    "quota_switch_project",
-    "quota_switch_preview",
     "debug",
     "management_password",
     "api_key",
@@ -217,6 +260,8 @@ PROXY_RESTART_KEYS = {
     "cache_ttl_jitter_seconds",
     "cache_stale_while_revalidate_seconds",
     "cache_stale_if_error_seconds",
+    "gateway_rate_limit_rpm",
+    "gateway_max_concurrent_requests",
 }
 
 proxy_process = None
@@ -302,12 +347,13 @@ def _launcher_port_file() -> str:
 
 
 def _write_launcher_port_file(port: int):
-    if not _is_frozen_exe():
-        return
     try:
         os.makedirs(ROOT, exist_ok=True)
-        with open(_launcher_port_file(), "w", encoding="utf-8") as f:
+        target = _launcher_port_file()
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(str(int(port)))
+        os.replace(tmp, target)
     except Exception:
         pass
 
@@ -316,7 +362,8 @@ def _read_launcher_port_file() -> int:
     try:
         with open(_launcher_port_file(), "r", encoding="utf-8") as f:
             v = f.read().strip()
-        return int(v)
+        port = int(v)
+        return port if 1 <= port <= 65535 else 0
     except Exception:
         return 0
 
@@ -327,7 +374,12 @@ def _probe_launcher_port(port: int) -> bool:
         import urllib.request
         import urllib.error
 
-        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/api/status", timeout=0.35) as r:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{int(port)}/api/status",
+            headers={"Connection": "close"},
+        )
+        with opener.open(request, timeout=0.35) as r:
             code = int(getattr(r, "status", 0) or 0)
         return 200 <= code < 300
     except urllib.error.HTTPError as e:
@@ -384,6 +436,19 @@ _cache_served_tokens = 0
 _cache_swr_refreshes = 0
 _cache_swr_refresh_errors = 0
 _cache_inflight = {}  # key -> threading.Event
+
+# ---- 网关限流：per-client 凭据 RPM + 全局并发 ----
+# 目的：网关持有的是用户自己的上游额度，任何一个客户端（或跑飞的循环）都不应该
+# 独占它。这里只做本地闸门，不做账号轮换，也不试图绕过任何上游限制。
+_ratelimit_lock = threading.Lock()
+_ratelimit_hits = OrderedDict()  # identity -> deque[monotonic timestamps]
+_ratelimit_rejects = 0
+_concurrency_active = 0
+_concurrency_peak = 0
+_concurrency_rejects = 0
+# 上限跟踪身份数，避免被大量伪造 Authorization 头撑爆内存
+_RATELIMIT_MAX_TRACKED = 1024
+
 _gateway_cfg = {
     "cache_enabled": False,
     "cache_stream_enabled": False,
@@ -395,6 +460,20 @@ _gateway_cfg = {
     "stale_while_revalidate_seconds": 0,
     "stale_if_error_seconds": 0,
 }
+# 闸门默认值只有一处事实源（default_settings）。网关未启动时 /api/status 也会读
+# _gateway_cfg，若这里写 0 会让人误判限流是关闭的。
+_DEFAULT_RATE_LIMIT_RPM = 600
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+
+
+def _fresh_gateway_cfg_defaults() -> dict:
+    return {
+        "rate_limit_rpm": _DEFAULT_RATE_LIMIT_RPM,
+        "max_concurrent_requests": _DEFAULT_MAX_CONCURRENT_REQUESTS,
+    }
+
+
+_gateway_cfg.update(_fresh_gateway_cfg_defaults())
 
 
 from launcher_security import _REDACT_PATTERNS, _redact_text
@@ -518,10 +597,9 @@ def default_settings():
         "api_keys_extra": "",
         "proxy_port": DEFAULT_PROXY_PORT,
         "proxy_host": "127.0.0.1",
+        "allow_remote_proxy": False,
         "routing_strategy": "round-robin",
         "request_retry": 3,
-        "quota_switch_project": True,
-        "quota_switch_preview": True,
         "debug": False,
         # ===== 健康监控（只读）=====
         # 监控只做服务可达性和用量摘要检查，不修改用户的 provider 凭据或认证文件。
@@ -562,6 +640,13 @@ def default_settings():
         # stale-if-error（秒）：条目过期后，在该窗口内若回源失败/限流，可返回旧缓存兜底。
         # 默认 0=关闭。
         "cache_stale_if_error_seconds": 0,
+        # ===== 网关限流（每个客户端凭据独立计算）=====
+        # 网关花的是用户自己的上游额度，所以默认就带闸门：单个客户端 key 跑飞
+        # （重试风暴、循环调用）不应该把额度一次性烧光。默认值取正常单机用量的
+        # 十几倍，够宽松；0 = 关闭。
+        "gateway_rate_limit_rpm": _DEFAULT_RATE_LIMIT_RPM,
+        # 全局在途请求上限（所有凭据合计），防止并发把内存和上游连接打满；0 = 关闭。
+        "gateway_max_concurrent_requests": _DEFAULT_MAX_CONCURRENT_REQUESTS,
     }
 
 
@@ -721,8 +806,10 @@ request-retry: {s.get('request_retry', 3)}
 max-retry-credentials: 3
 
 quota-exceeded:
-  switch-project: {str(s.get('quota_switch_project', True)).lower()}
-  switch-preview-model: {str(s.get('quota_switch_preview', True)).lower()}
+  # AIProxyHub never changes projects or model classes to work around an
+  # upstream usage limit.  These values are intentionally hard-disabled.
+  switch-project: false
+  switch-preview-model: false
 
 routing:
   strategy: {_yaml_escape(s.get('routing_strategy', 'fill-first'))}
@@ -818,6 +905,8 @@ def preflight(kind: str, s: dict):
         # 更安全默认：当监听地址非本机回环时，强制用户修改弱默认值，避免局域网误暴露
         host = str(s.get("proxy_host", "127.0.0.1") or "").strip().lower()
         if host and host not in ("127.0.0.1", "localhost", "::1"):
+            if not _coerce_bool(s.get("allow_remote_proxy", False)):
+                return False, "非本机网关监听默认关闭：请显式启用“允许远程网关”并做好网络隔离"
             weak_mgmt = _is_weak_secret(
                 s.get("management_password", ""),
                 min_len=12,
@@ -826,6 +915,8 @@ def preflight(kind: str, s: dict):
             client_keys = _get_all_client_api_keys(s)
             weak_client_key = any(_is_weak_secret(k, min_len=16) for k in (client_keys or []))
             admin_key = str(s.get("admin_api_key", "") or "").strip()
+            if not admin_key:
+                return False, "监听地址非本地时必须设置独立的管理 API Key，不能复用客户端 API Key"
             weak_admin_key = bool(admin_key) and _is_weak_secret(
                 admin_key,
                 min_len=16,
@@ -890,6 +981,14 @@ def _gateway_set_config_from_settings(s: dict):
         swr = 0
     if sie < 0:
         sie = 0
+    # UI 的 number 输入回传的是字符串，且可能为空/非法；限流值不合法时退回默认闸门，
+    # 不要让一次错误输入把整个网关的启动打挂。
+    rate_limit_rpm = _coerce_non_negative_int(
+        s.get("gateway_rate_limit_rpm"), _DEFAULT_RATE_LIMIT_RPM
+    )
+    max_concurrent = _coerce_non_negative_int(
+        s.get("gateway_max_concurrent_requests"), _DEFAULT_MAX_CONCURRENT_REQUESTS
+    )
     _gateway_cfg = {
         "cache_enabled": cache_enabled,
         "cache_stream_enabled": cache_stream_enabled,
@@ -901,6 +1000,8 @@ def _gateway_set_config_from_settings(s: dict):
         "stale_while_revalidate_seconds": swr,
         "stale_if_error_seconds": sie,
         "vary_headers": vary_headers,
+        "rate_limit_rpm": rate_limit_rpm,
+        "max_concurrent_requests": max_concurrent,
     }
 
 
@@ -970,6 +1071,96 @@ def _cache_auth_for_key(auth_header: str) -> str:
     contain private source code or provider-specific policy context.
     """
     return str(auth_header or "")
+
+
+def _ratelimit_identity(auth_header: str) -> str:
+    """限流身份 = 客户端凭据的短摘要。
+
+    只保留摘要，保证限流表和统计里不出现明文 key（日志脱敏之外的第二道防线）。
+    """
+    raw = str(auth_header or "").strip()
+    if not raw:
+        return "anonymous"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _ratelimit_check(auth_header: str) -> tuple[bool, int]:
+    """滑动窗口 RPM 检查，返回 (是否放行, Retry-After 秒)。
+
+    rpm <= 0 表示关闭。窗口按每个客户端凭据独立计算，凭据之间不共享配额。
+    """
+    global _ratelimit_rejects
+    rpm = int(_gateway_cfg.get("rate_limit_rpm", 0) or 0)
+    if rpm <= 0:
+        return True, 0
+    ident = _ratelimit_identity(auth_header)
+    now = time.monotonic()
+    with _ratelimit_lock:
+        hits = _ratelimit_hits.get(ident)
+        if hits is None:
+            hits = deque()
+            _ratelimit_hits[ident] = hits
+        _ratelimit_hits.move_to_end(ident)
+        while hits and (now - hits[0]) >= 60.0:
+            hits.popleft()
+        if len(hits) >= rpm:
+            _ratelimit_rejects += 1
+            return False, max(1, int(60.0 - (now - hits[0])) + 1)
+        hits.append(now)
+        # 当前身份刚被 move_to_end，淘汰最旧的不会误伤它
+        while len(_ratelimit_hits) > _RATELIMIT_MAX_TRACKED:
+            _ratelimit_hits.popitem(last=False)
+        return True, 0
+
+
+def _concurrency_acquire() -> bool:
+    """占用一个全局并发槽。返回 False 表示已满（调用方回 503）。
+
+    返回 True 时一定已计数，因此调用方必须在 finally 中配对调用
+    ``_concurrency_release()``；这样即使运行中改了上限也不会泄漏计数。
+    """
+    global _concurrency_active, _concurrency_peak, _concurrency_rejects
+    limit = int(_gateway_cfg.get("max_concurrent_requests", 0) or 0)
+    with _ratelimit_lock:
+        if limit > 0 and _concurrency_active >= limit:
+            _concurrency_rejects += 1
+            return False
+        _concurrency_active += 1
+        if _concurrency_active > _concurrency_peak:
+            _concurrency_peak = _concurrency_active
+        return True
+
+
+def _concurrency_release():
+    global _concurrency_active
+    with _ratelimit_lock:
+        if _concurrency_active > 0:
+            _concurrency_active -= 1
+
+
+def _ratelimit_reset():
+    """清空限流窗口与计数（供测试和“清空缓存”类运维动作使用）。"""
+    global _ratelimit_rejects, _concurrency_active, _concurrency_peak, _concurrency_rejects
+    with _ratelimit_lock:
+        _ratelimit_hits.clear()
+        _ratelimit_rejects = 0
+        _concurrency_active = 0
+        _concurrency_peak = 0
+        _concurrency_rejects = 0
+
+
+def _ratelimit_stats():
+    with _ratelimit_lock:
+        return {
+            "rate_limit_rpm": int(_gateway_cfg.get("rate_limit_rpm", 0) or 0),
+            "max_concurrent_requests": int(_gateway_cfg.get("max_concurrent_requests", 0) or 0),
+            "scope": "per-client-credential",
+            "tracked_clients": int(len(_ratelimit_hits)),
+            "rate_limited": int(_ratelimit_rejects),
+            "concurrency_active": int(_concurrency_active),
+            "concurrency_peak": int(_concurrency_peak),
+            "concurrency_rejected": int(_concurrency_rejects),
+        }
 
 
 def _cache_key_for_request(method: str, path: str, auth: str, body_bytes: bytes, *, vary: list[tuple[str, str]] | None = None) -> str:
@@ -1569,19 +1760,64 @@ def _make_gateway_handler(upstream_host: str, upstream_port: int):
             return
 
         def do_GET(self):
-            self._handle()
+            self._dispatch()
 
         def do_POST(self):
-            self._handle()
+            self._dispatch()
 
         def do_PUT(self):
-            self._handle()
+            self._dispatch()
 
         def do_PATCH(self):
-            self._handle()
+            self._dispatch()
 
         def do_DELETE(self):
-            self._handle()
+            self._dispatch()
+
+        def _send_throttled(self, status: int, message: str, err_type: str, retry_after: int):
+            body = json.dumps(
+                {"error": {"message": message, "type": err_type, "code": status}},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                if retry_after > 0:
+                    self.send_header("Retry-After", str(int(retry_after)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def _dispatch(self):
+            """限流闸门 → _handle。
+
+            并发槽先占后放（finally 配对），RPM 在槽内检查：被限流的请求也算一次
+            在途，避免限流本身变成绕过并发上限的旁路。
+            """
+            if not _concurrency_acquire():
+                self._send_throttled(
+                    503,
+                    "网关在途请求已达上限，请稍后重试（可在管理面板调整“全局并发上限”）。",
+                    "server_overloaded",
+                    1,
+                )
+                return
+            try:
+                allowed, retry_after = _ratelimit_check(self.headers.get("Authorization", "") or "")
+                if not allowed:
+                    self._send_throttled(
+                        429,
+                        "已超出该客户端凭据的每分钟请求上限（可在管理面板调整 RPM）。",
+                        "rate_limit_exceeded",
+                        retry_after,
+                    )
+                    return
+                self._handle()
+            finally:
+                _concurrency_release()
 
         def _read_body(self) -> bytes:
             try:
@@ -2762,6 +2998,7 @@ def start_proxy():
         if gw_enabled:
             _gateway_set_config_from_settings(s)
             _cache_clear()  # 新一轮启动：清空缓存与统计，避免误判
+            _ratelimit_reset()  # 同理：旧窗口和在途计数不应跨重启累积
 
             internal_port = find_free_port(external_port + 1, host="127.0.0.1")
 
@@ -3019,12 +3256,24 @@ def secure_cleanup_outputs():
     msg = f"已清理 {removed} 个过期运行时配置"
     log(f"[SYS] {msg}")
     return {"ok": True, "msg": msg}
-def _proxy_reachable(port):
-    """检查代理端口是否可连通（主要用于等待代理就绪/端口占用预判）。"""
+def _proxy_reachable(port, timeout=0.6):
+    """检查本机代理端口，不能被系统代理或丢包拖慢管理面板。"""
     try:
-        import urllib.request, urllib.error
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=2)
-        return True
+        import urllib.error
+        import urllib.request
+
+        checked_port = _coerce_port(port, 0)
+        if not checked_port:
+            return False
+        # 这是本机健康探测，必须绕过 Clash/Mihomo；否则一个本机空端口会
+        # 被外部代理接管，造成误判和每次约 2 秒的 UI 卡顿。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{checked_port}/v1/models",
+            headers={"Connection": "close"},
+        )
+        with opener.open(request, timeout=max(0.2, min(float(timeout), 5.0))):
+            return True
     except urllib.error.HTTPError as e:
         # 未带 API Key 时，CLIProxyAPI 通常会返回 401/403，这代表服务已在运行。
         # 其它 4xx/5xx（例如 404/502）更可能是“不是目标服务”或“内部尚未就绪”，因此不视为可用。
@@ -3094,8 +3343,8 @@ label{font-size:12px;color:var(--muted)}input,select,textarea{width:100%;padding
   <div class="field"><label>上游代理（可选）</label><input id="proxy_url" placeholder="http://127.0.0.1:7890"></div><div class="field"><label>监听地址</label><input id="proxy_host" placeholder="127.0.0.1"></div><div class="field"><label>监听端口</label><input id="proxy_port" type="number" min="1" max="65535"></div><div class="field"><label>路由策略</label><select id="routing_strategy"><option value="round-robin">round-robin</option><option value="fill-first">fill-first</option></select></div><div class="field"><label>请求重试次数</label><input id="request_retry" type="number" min="0" max="10"></div>
   <div class="field"><label>管理密码（留空保持）</label><input id="management_password" type="password" autocomplete="new-password"></div><div class="field"><label>客户端 API Key（留空保持）</label><input id="api_key" type="password" autocomplete="new-password"></div><div class="field"><label>管理 API Key（留空保持）</label><input id="admin_api_key" type="password" autocomplete="new-password"></div><div class="field full"><label>额外客户端 API Key（每行一把，留空保持）</label><textarea id="api_keys_extra" rows="3"></textarea></div><div class="field full"><label>缓存 Vary Headers</label><input id="cache_vary_headers"></div>
 </div>
-<div class="form" style="margin-top:14px"><label class="check"><input id="quota_switch_project" type="checkbox">配额异常时切换项目</label><label class="check"><input id="quota_switch_preview" type="checkbox">配额异常时切换预览模型</label><label class="check"><input id="debug" type="checkbox">调试日志</label><label class="check"><input id="gateway_enabled" type="checkbox">启用透明网关</label><label class="check"><input id="cache_enabled" type="checkbox">启用非流式缓存</label><label class="check"><input id="cache_stream_enabled" type="checkbox">启用流式缓存（谨慎）</label><label class="check"><input id="monitor_enabled" type="checkbox">启用只读健康监控</label></div>
-<div class="form" style="margin-top:14px"><div class="field"><label>监控间隔（秒）</label><input id="monitor_interval_seconds" type="number" min="10"></div><div class="field"><label>缓存 TTL（秒）</label><input id="cache_ttl_seconds" type="number" min="1"></div><div class="field"><label>TTL 抖动（秒）</label><input id="cache_ttl_jitter_seconds" type="number" min="0"></div><div class="field"><label>最大缓存条目</label><input id="cache_max_entries" type="number" min="0"></div><div class="field"><label>单条最大 KB</label><input id="cache_max_body_kb" type="number" min="1"></div><div class="field"><label>缓存总上限 MB</label><input id="cache_max_total_mb" type="number" min="0"></div><div class="field"><label>SWR 秒数</label><input id="cache_stale_while_revalidate_seconds" type="number" min="0"></div><div class="field"><label>SIE 秒数</label><input id="cache_stale_if_error_seconds" type="number" min="0"></div></div>
+<div class="form" style="margin-top:14px"><label class="check"><input id="allow_remote_proxy" type="checkbox">允许远程网关（危险）</label><label class="check"><input id="debug" type="checkbox">调试日志</label><label class="check"><input id="gateway_enabled" type="checkbox">启用透明网关</label><label class="check"><input id="cache_enabled" type="checkbox">启用非流式缓存</label><label class="check"><input id="cache_stream_enabled" type="checkbox">启用流式缓存（谨慎）</label><label class="check"><input id="monitor_enabled" type="checkbox">启用只读健康监控</label></div>
+<div class="form" style="margin-top:14px"><div class="field"><label>监控间隔（秒）</label><input id="monitor_interval_seconds" type="number" min="10"></div><div class="field"><label>缓存 TTL（秒）</label><input id="cache_ttl_seconds" type="number" min="1"></div><div class="field"><label>TTL 抖动（秒）</label><input id="cache_ttl_jitter_seconds" type="number" min="0"></div><div class="field"><label>最大缓存条目</label><input id="cache_max_entries" type="number" min="0"></div><div class="field"><label>单条最大 KB</label><input id="cache_max_body_kb" type="number" min="1"></div><div class="field"><label>缓存总上限 MB</label><input id="cache_max_total_mb" type="number" min="0"></div><div class="field"><label>SWR 秒数</label><input id="cache_stale_while_revalidate_seconds" type="number" min="0"></div><div class="field"><label>SIE 秒数</label><input id="cache_stale_if_error_seconds" type="number" min="0"></div><div class="field"><label>每凭据 RPM 上限（0=关闭）</label><input id="gateway_rate_limit_rpm" type="number" min="0"></div><div class="field"><label>全局并发上限（0=关闭）</label><input id="gateway_max_concurrent_requests" type="number" min="0"></div></div>
 <p class="hint note">密钥不会由页面回显；落盘使用 Windows DPAPI。不要把 provider 凭据提交到 Issue、日志或仓库。</p><div class="toolbar"><button class="btn primary" onclick="saveSettings()">保存配置</button><button class="btn" onclick="loadSettings()">重新读取</button></div></section>
 <section class="card"><h2>健康监控</h2><div class="toolbar"><button class="btn" onclick="post('/api/start_monitor')">启动</button><button class="btn" onclick="post('/api/stop_monitor')">停止</button><button class="btn" onclick="post('/api/trigger_monitor')">立即检查</button></div><pre id="monitor_detail">--</pre></section>
 <section class="card"><h2>运行日志</h2><div class="toolbar"><button class="btn" onclick="post('/api/clear_logs')">清空日志</button><button class="btn" onclick="refreshLogs()">刷新</button></div><pre id="logs">--</pre></section>
@@ -3106,7 +3355,7 @@ const TOKEN="__API_TOKEN__",headers=()=>({"X-AIProxyHub-Token":TOKEN}),$=id=>doc
 function notice(v){$("notice").textContent=String(v||"")}
 async function request(path,opt={}){const h=Object.assign({},headers(),opt.headers||{}),r=await fetch(path,Object.assign({},opt,{headers:h})),d=await r.json().catch(()=>({ok:false,msg:"invalid response"}));if(!r.ok)throw Error(d.msg||("HTTP "+r.status));return d}
 async function post(path,body={}){try{const d=await request(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});notice(d.msg||"已完成");await refreshAll();return d}catch(e){notice("失败："+e.message)}}
-const normal=["proxy_url","proxy_host","proxy_port","routing_strategy","request_retry","quota_switch_project","quota_switch_preview","debug","monitor_enabled","monitor_interval_seconds","gateway_enabled","cache_enabled","cache_stream_enabled","cache_vary_headers","cache_ttl_seconds","cache_ttl_jitter_seconds","cache_max_entries","cache_max_body_kb","cache_max_total_mb","cache_stale_while_revalidate_seconds","cache_stale_if_error_seconds"],secrets=["management_password","api_key","admin_api_key","api_keys_extra"];
+const normal=["proxy_url","proxy_host","proxy_port","allow_remote_proxy","routing_strategy","request_retry","debug","monitor_enabled","monitor_interval_seconds","gateway_enabled","cache_enabled","cache_stream_enabled","cache_vary_headers","cache_ttl_seconds","cache_ttl_jitter_seconds","cache_max_entries","cache_max_body_kb","cache_max_total_mb","cache_stale_while_revalidate_seconds","cache_stale_if_error_seconds","gateway_rate_limit_rpm","gateway_max_concurrent_requests"],secrets=["management_password","api_key","admin_api_key","api_keys_extra"];
 function setField(id,v){const e=$(id);if(!e)return;if(e.type==="checkbox")e.checked=!!v;else e.value=v??""}
 async function loadSettings(){try{const s=await request("/api/settings");$("version").textContent="v"+(s.version||"");normal.forEach(id=>setField(id,id==="proxy_url"?s.proxy:s[id]));secrets.forEach(id=>setField(id,""));notice("已读取配置（敏感字段不会回显）")}catch(e){notice("读取失败："+e.message)}}
 function collect(){const d={};normal.forEach(id=>{const e=$(id);d[id==="proxy_url"?"proxy":id]=e.type==="checkbox"?e.checked:e.value});secrets.forEach(id=>d[id]=$(id).value);return d}
@@ -3201,6 +3450,7 @@ def _build_status_response() -> dict:
             "listen_port": gateway_listen_port,
             "upstream_port": gateway_upstream_port,
             "cache": _cache_stats(),
+            "limits": _ratelimit_stats(),
         },
     }
 

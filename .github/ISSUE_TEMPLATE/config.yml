@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞报告
+    url: https://github.com/WJH-makers/AIProxyHub/security/advisories/new
+    about: 请通过私有 Security Advisory 报告漏洞，不要开公开 Issue。不要粘贴凭据、token 或私有 prompt。
+  - name: 使用指南
+    url: https://github.com/WJH-makers/AIProxyHub/blob/main/使用指南.md
+    about: 启动、配置、网关限流、缓存边界和数据位置说明。

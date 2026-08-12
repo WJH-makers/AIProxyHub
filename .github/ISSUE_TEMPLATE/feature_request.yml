@@ -1,0 +1,33 @@
+name: 功能建议
+description: 提出改进或新能力
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        AIProxyHub 只做本地网关管理。超出这个边界的能力不会被接受，
+        具体见 CONTRIBUTING.md 的「不接受的方向」。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决什么问题
+      description: 描述实际遇到的场景，而不是直接给实现方案。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 设想的方案
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案（可选）
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: 边界确认
+      options:
+        - label: 这个建议不涉及第三方账户创建、临时邮箱/OTP、虚假身份、反机器人绕过、消费者 token 提取或规避 provider 使用限制
+          required: true

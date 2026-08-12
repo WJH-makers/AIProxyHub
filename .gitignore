@@ -16,6 +16,8 @@ data/
 # 运行时临时产物
 *.runtime.*
 *.log
+launcher.port
+launcher.port.tmp
 
 # 构建产物
 dist/
@@ -28,7 +30,6 @@ release/
 
 # 第三方二进制（如需请自行下载/放置；不建议提交到公开仓库）
 cli-proxy-api.exe
-cli-proxy-api.provenance.json
 
 # Secrets / credentials / local provider state
 .env
